@@ -60,6 +60,14 @@
 
 namespace rex::graphics::d3d12 {
 
+// Measurement builds: RenderDoc's in-application API table (plugin_main.cpp)
+// and a request to capture whole guest frames. RenderDoc's own frame boundary
+// is a host present, and at high refresh rates one guest frame spans several;
+// the command processor starts and ends the capture at guest swaps instead,
+// after draining its submission thread, so a capture holds complete frames.
+void SetRenderDocApi(void** api);
+void RequestRenderDocGuestFrames(uint32_t frames);
+
 class D3D12CommandProcessor : public CommandProcessor {
  public:
   explicit D3D12CommandProcessor(D3D12GraphicsSystem* graphics_system,

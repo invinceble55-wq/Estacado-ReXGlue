@@ -22,6 +22,8 @@
 #include <ctime>
 #include <exception>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -35,6 +37,26 @@
 REXCVAR_DECLARE(bool, embedded_interrupt_wait_wakeup);
 REXCVAR_DECLARE(uint32_t, display_frame_limit);
 REXCVAR_DECLARE(std::string, display_present_mode);
+REXCVAR_DECLARE(std::string, input_bind_a);
+REXCVAR_DECLARE(std::string, input_bind_b);
+REXCVAR_DECLARE(std::string, input_bind_x);
+REXCVAR_DECLARE(std::string, input_bind_y);
+REXCVAR_DECLARE(std::string, input_bind_left_trigger);
+REXCVAR_DECLARE(std::string, input_bind_right_trigger);
+REXCVAR_DECLARE(std::string, input_bind_left_shoulder);
+REXCVAR_DECLARE(std::string, input_bind_right_shoulder);
+REXCVAR_DECLARE(std::string, input_bind_lstick_up);
+REXCVAR_DECLARE(std::string, input_bind_lstick_down);
+REXCVAR_DECLARE(std::string, input_bind_lstick_left);
+REXCVAR_DECLARE(std::string, input_bind_lstick_right);
+REXCVAR_DECLARE(std::string, input_bind_lstick_press);
+REXCVAR_DECLARE(std::string, input_bind_rstick_press);
+REXCVAR_DECLARE(std::string, input_bind_dpad_up);
+REXCVAR_DECLARE(std::string, input_bind_dpad_down);
+REXCVAR_DECLARE(std::string, input_bind_dpad_left);
+REXCVAR_DECLARE(std::string, input_bind_dpad_right);
+REXCVAR_DECLARE(std::string, input_bind_back);
+REXCVAR_DECLARE(std::string, input_bind_start);
 #if defined(_WIN32)
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -44,6 +66,7 @@ REXCVAR_DECLARE(std::string, display_present_mode);
 #include <intrin.h>
 #endif
 #include <rex/graphics/pipeline/texture/texture_pack.h>
+#include <rex/graphics/pipeline/texture/prompt_icons.h>
 #include <rex/ui/settings_detection.h>
 #include <rex/ui/guest_frame_limiter.h>
 #include <rex/ui/frame_rate_policy.h>
@@ -181,10 +204,40 @@ bool PatchMotionBlurOff(std::vector<uint32_t>& ucode) {
 #if REX_HAS_D3D12
 #include <rex/graphics/embedded_diagnostics.h>
 #include <rex/graphics/d3d12/graphics_system.h>
+#include <rex/graphics/d3d12/pipeline_cache.h>
+#include <rex/graphics/d3d12/command_processor.h>
+#include <rex/ui/overlay/shader_prewarm_indicator.h>
 #endif
 #if REX_HAS_VULKAN
 #include <rex/graphics/vulkan/graphics_system.h>
 #endif
+
+
+// Keyboard button prompts (prompt_icons.h): the key bound to a controller
+// button, from this plugin's input cvars (the overlay changes them live).
+static std::string PromptBindingValue(std::string_view button) {
+  if (button == "a") return REXCVAR_GET(input_bind_a);
+  if (button == "b") return REXCVAR_GET(input_bind_b);
+  if (button == "x") return REXCVAR_GET(input_bind_x);
+  if (button == "y") return REXCVAR_GET(input_bind_y);
+  if (button == "left_trigger") return REXCVAR_GET(input_bind_left_trigger);
+  if (button == "right_trigger") return REXCVAR_GET(input_bind_right_trigger);
+  if (button == "left_shoulder") return REXCVAR_GET(input_bind_left_shoulder);
+  if (button == "right_shoulder") return REXCVAR_GET(input_bind_right_shoulder);
+  if (button == "lstick_up") return REXCVAR_GET(input_bind_lstick_up);
+  if (button == "lstick_down") return REXCVAR_GET(input_bind_lstick_down);
+  if (button == "lstick_left") return REXCVAR_GET(input_bind_lstick_left);
+  if (button == "lstick_right") return REXCVAR_GET(input_bind_lstick_right);
+  if (button == "lstick_press") return REXCVAR_GET(input_bind_lstick_press);
+  if (button == "rstick_press") return REXCVAR_GET(input_bind_rstick_press);
+  if (button == "dpad_up") return REXCVAR_GET(input_bind_dpad_up);
+  if (button == "dpad_down") return REXCVAR_GET(input_bind_dpad_down);
+  if (button == "dpad_left") return REXCVAR_GET(input_bind_dpad_left);
+  if (button == "dpad_right") return REXCVAR_GET(input_bind_dpad_right);
+  if (button == "back") return REXCVAR_GET(input_bind_back);
+  if (button == "start") return REXCVAR_GET(input_bind_start);
+  return {};
+}
 
 extern "C" REX_GPU_PLUGIN_EXPORT uint32_t rex_gpu_abi_version(void) {
   return rex::system::kGpuPluginAbiVersion;
@@ -561,6 +614,14 @@ void EmbeddedSettingsOverlayListener::Open() {
         embedded_.settings_overlay_open.store(false, std::memory_order_release);
         std::fprintf(stderr, "REX_SETTINGS_OVERLAY open=0 via=resume\n");
         std::fflush(stderr);
+      },
+      [this]() {
+        // Quit game: the close request of Alt+F4, so the runtime's close
+        // listener stops the title (RequestClose would destroy the window
+        // without asking it).
+        std::fprintf(stderr, "REX_SETTINGS_OVERLAY quit=1\n");
+        std::fflush(stderr);
+        static_cast<rex::ui::WindowSDL*>(window_)->PostCloseRequest();
       });
   embedded_.settings_overlay_open.store(true, std::memory_order_release);
   std::fprintf(stderr, "REX_SETTINGS_OVERLAY open=1\n");
@@ -833,6 +894,96 @@ class EmbeddedCloseRequestListener final : public rex::ui::WindowListener {
   EmbeddedGpu& embedded_;
 };
 
+#if REX_HAS_D3D12
+// 0.9.1 (#5): while the D3D12 shader prewarm creates pipelines (when an
+// area's shaders first appear in memory, mostly while it loads), a small
+// progress bar in the top-left corner (rex::ui::ShaderPrewarmIndicatorDialog).
+// A poller posts show/hide to the UI thread; while the prewarm is idle the
+// drawer holds no dialog (no cost).
+class EmbeddedShaderPrewarmIndicator {
+ public:
+  EmbeddedShaderPrewarmIndicator(rex::ui::SDLWindowedAppContext& context, rex::ui::Window* window,
+                                 rex::graphics::GraphicsSystem* graphics)
+      : context_(context), window_(window), graphics_(graphics) {
+    poller_ = std::thread([this]() { Poll(); });
+  }
+  ~EmbeddedShaderPrewarmIndicator() { Shutdown(); }
+
+  // UI thread, before the window goes.
+  void Shutdown() {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      stop_ = true;
+    }
+    condition_.notify_all();
+    if (poller_.joinable()) {
+      poller_.join();
+      context_.ExecutePendingFunctionsFromUIThread();
+    }
+    dialog_.reset();
+    if (imgui_drawer_) {
+      imgui_drawer_->SetPresenterAndImmediateDrawer(nullptr, nullptr);
+      imgui_drawer_.reset();
+    }
+    if (immediate_drawer_) {
+      immediate_drawer_->SetPresenter(nullptr);
+      immediate_drawer_.reset();
+    }
+  }
+
+ private:
+  void Poll() {
+    bool shown = false;
+    auto last_pending = std::chrono::steady_clock::now();
+    std::unique_lock<std::mutex> lock(mutex_);
+    while (!condition_.wait_for(lock, std::chrono::milliseconds(250), [this]() { return stop_; })) {
+      const auto status = rex::graphics::d3d12::GetShaderPrewarmStatus();
+      const auto now = std::chrono::steady_clock::now();
+      if (status.handled < status.queued) last_pending = now;
+      // Shown while pipelines are pending and one second after.
+      const bool show = now - last_pending < std::chrono::seconds(1) && status.queued;
+      if (show != shown) {
+        shown = show;
+        context_.CallInUIThreadDeferred([this, show]() { Show(show); });
+      }
+    }
+  }
+  void Show(bool show) {
+    if (!show) {
+      dialog_.reset();
+      return;
+    }
+    if (dialog_ || !EnsureDrawer()) return;
+    dialog_ = std::make_unique<rex::ui::ShaderPrewarmIndicatorDialog>(
+        imgui_drawer_.get(), []() {
+          const auto status = rex::graphics::d3d12::GetShaderPrewarmStatus();
+          return rex::ui::ShaderPrewarmProgress{status.queued, status.handled};
+        });
+  }
+  bool EnsureDrawer() {
+    if (imgui_drawer_) return true;
+    if (!window_ || !graphics_ || !graphics_->provider() || !graphics_->presenter()) return false;
+    immediate_drawer_ = graphics_->provider()->CreateImmediateDrawer();
+    if (!immediate_drawer_) return false;
+    immediate_drawer_->SetPresenter(graphics_->presenter());
+    imgui_drawer_ = std::make_unique<rex::ui::ImGuiDrawer>(window_, 48);
+    imgui_drawer_->SetPresenterAndImmediateDrawer(graphics_->presenter(), immediate_drawer_.get());
+    return true;
+  }
+
+  rex::ui::SDLWindowedAppContext& context_;
+  rex::ui::Window* window_ = nullptr;
+  rex::graphics::GraphicsSystem* graphics_ = nullptr;
+  std::unique_ptr<rex::ui::ImmediateDrawer> immediate_drawer_;
+  std::unique_ptr<rex::ui::ImGuiDrawer> imgui_drawer_;
+  std::unique_ptr<rex::ui::ShaderPrewarmIndicatorDialog> dialog_;
+  std::thread poller_;
+  std::mutex mutex_;
+  std::condition_variable condition_;
+  bool stop_ = false;
+};
+#endif
+
 bool StartEmbeddedPresentation(EmbeddedGpu& embedded, const char* backend) {
   embedded.presentation_thread = std::thread([&embedded, backend]() {
     rex::ui::SDLWindowedAppContext app_context;
@@ -842,6 +993,9 @@ bool StartEmbeddedPresentation(EmbeddedGpu& embedded, const char* backend) {
     std::unique_ptr<EmbeddedDevFrameModeListener> dev_frame_mode_listener;
     std::unique_ptr<EmbeddedSettingsOverlayListener> settings_overlay_listener;
     std::unique_ptr<EmbeddedOverlayInputBlocker> overlay_input_blocker;
+#if REX_HAS_D3D12
+    std::unique_ptr<EmbeddedShaderPrewarmIndicator> prewarm_indicator;
+#endif
     EmbeddedCloseRequestListener close_request_listener(embedded);
     rex::X_STATUS status = static_cast<rex::X_STATUS>(0xC0000001L);
 
@@ -892,6 +1046,10 @@ bool StartEmbeddedPresentation(EmbeddedGpu& embedded, const char* backend) {
                                std::numeric_limits<size_t>::max() - 3);
       overlay_input_blocker = std::make_unique<EmbeddedOverlayInputBlocker>(embedded);
       window->AddInputListener(overlay_input_blocker.get(), 32);
+#if REX_HAS_D3D12
+      prewarm_indicator = std::make_unique<EmbeddedShaderPrewarmIndicator>(
+          app_context, window.get(), embedded.graphics.get());
+#endif
       window->AddListener(&close_request_listener);
       if (embedded.keyboard_mouse) {
         auto* sdl_window = static_cast<rex::ui::WindowSDL*>(window.get());
@@ -933,6 +1091,12 @@ bool StartEmbeddedPresentation(EmbeddedGpu& embedded, const char* backend) {
     }
 
     embedded.native_window.store(nullptr, std::memory_order_release);
+#if REX_HAS_D3D12
+    if (prewarm_indicator) {
+      prewarm_indicator->Shutdown();
+      prewarm_indicator.reset();
+    }
+#endif
     if (window) {
       if (dev_frame_mode_listener) {
         window->RemoveInputListener(dev_frame_mode_listener.get());
@@ -1293,6 +1457,109 @@ extern "C" REX_GPU_PLUGIN_EXPORT void* rex_gpu_embedded_create(
     std::fprintf(stderr, "REX_PIX_GPU_CAPTURER loaded=%u path=%s\n", capturer ? 1u : 0u,
                  newest.empty() ? "(no PIX install)" : newest.u8string().c_str());
     std::fflush(stderr);
+    // pixtool only attaches to processes PIX launched itself, so captures are
+    // programmatic: REX_PIX_CAPTURE_REQUEST=<file>; when that file appears
+    // (its text = the .wpix path to write), the next frame is captured by
+    // the capturer's CaptureNextFrame (pix3's PIXGpuCaptureNextFrames) and
+    // the request file is removed (scripts/pix-capture.ps1).
+    using CaptureNextFrameFn = HRESULT(WINAPI*)(PCWSTR, UINT32);
+    const auto capture_next_frame = capturer ? reinterpret_cast<CaptureNextFrameFn>(
+                                                   GetProcAddress(capturer, "CaptureNextFrame"))
+                                             : nullptr;
+    const char* request = std::getenv("REX_PIX_CAPTURE_REQUEST");
+    if (capture_next_frame && request && *request) {
+      std::thread([capture_next_frame, request_path = std::filesystem::u8path(request)]() {
+        for (;;) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(200));
+          std::error_code error;
+          if (!std::filesystem::exists(request_path, error)) continue;
+          std::ifstream file(request_path, std::ios::binary);
+          std::string target((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+          file.close();
+          while (!target.empty() && (target.back() == '\n' || target.back() == '\r' ||
+                                     target.back() == ' ')) {
+            target.pop_back();
+          }
+          std::filesystem::remove(request_path, error);
+          if (target.empty()) continue;
+          const HRESULT result =
+              capture_next_frame(std::filesystem::u8path(target).wstring().c_str(), 1);
+          std::fprintf(stderr, "REX_PIX_CAPTURE requested=%s result=0x%08X\n", target.c_str(),
+                       static_cast<unsigned>(result));
+          std::fflush(stderr);
+        }
+      }).detach();
+    }
+  }
+  // Measurement builds: REX_RENDERDOC_DLL=<renderdoc.dll> loads RenderDoc's
+  // in-application API before any Direct3D 12 device exists (its captures
+  // replay without Windows Developer Mode, unlike PIX's). Captures are
+  // requested like PIX's: REX_RENDERDOC_CAPTURE_REQUEST=<file>, whose text is
+  // the capture path template; RenderDoc's own overlay is hidden so window
+  // snapshots stay clean (docs/TOOLS_INSTALLED.md).
+  if (const char* renderdoc_dll = std::getenv("REX_RENDERDOC_DLL"); renderdoc_dll && *renderdoc_dll) {
+    HMODULE renderdoc = LoadLibraryW(std::filesystem::u8path(renderdoc_dll).wstring().c_str());
+    using GetApiFn = int(__cdecl*)(int version, void** api);
+    const auto get_api = renderdoc ? reinterpret_cast<GetApiFn>(
+                                         GetProcAddress(renderdoc, "RENDERDOC_GetAPI"))
+                                   : nullptr;
+    // RENDERDOC_API_1_1_2 function table, by slot (renderdoc_app.h).
+    void** api = nullptr;
+    const bool api_ok = get_api && get_api(10102, reinterpret_cast<void**>(&api)) == 1 && api;
+    std::fprintf(stderr, "REX_RENDERDOC loaded=%u api=%u path=%s\n", renderdoc ? 1u : 0u,
+                 api_ok ? 1u : 0u, renderdoc_dll);
+    std::fflush(stderr);
+    const char* request = std::getenv("REX_RENDERDOC_CAPTURE_REQUEST");
+    if (api_ok) {
+      using MaskOverlayBitsFn = void(__cdecl*)(uint32_t, uint32_t);
+      reinterpret_cast<MaskOverlayBitsFn>(api[8])(0, 0);
+      // Whole guest frames: the command processor starts and ends captures
+      // at guest swaps (RenderDoc's own boundary is a host present).
+      rex::graphics::d3d12::SetRenderDocApi(api);
+    }
+    if (api_ok && request && *request) {
+      std::thread([api, request_path = std::filesystem::u8path(request)]() {
+        using SetTemplateFn = void(__cdecl*)(const char*);
+        using GetNumCapturesFn = uint32_t(__cdecl*)();
+        using GetCaptureFn = uint32_t(__cdecl*)(uint32_t, char*, uint32_t*, uint64_t*);
+        uint32_t reported = 0;
+        for (;;) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(200));
+          const uint32_t captures = reinterpret_cast<GetNumCapturesFn>(api[13])();
+          for (; reported < captures; ++reported) {
+            uint32_t length = 0;
+            reinterpret_cast<GetCaptureFn>(api[14])(reported, nullptr, &length, nullptr);
+            std::string name(length, '\0');
+            reinterpret_cast<GetCaptureFn>(api[14])(reported, name.data(), &length, nullptr);
+            while (!name.empty() && name.back() == '\0') name.pop_back();
+            std::fprintf(stderr, "REX_RENDERDOC_CAPTURE written=%s\n", name.c_str());
+            std::fflush(stderr);
+          }
+          std::error_code error;
+          if (!std::filesystem::exists(request_path, error)) continue;
+          std::ifstream file(request_path, std::ios::binary);
+          std::string target((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+          file.close();
+          while (!target.empty() && (target.back() == '\n' || target.back() == '\r' ||
+                                     target.back() == ' ')) {
+            target.pop_back();
+          }
+          std::filesystem::remove(request_path, error);
+          // "<path template>[|<guest frames>]", 2 frames by default.
+          uint32_t frames = 2;
+          if (const size_t bar = target.rfind('|'); bar != std::string::npos) {
+            frames = std::clamp<uint32_t>(uint32_t(std::strtoul(target.c_str() + bar + 1, nullptr, 10)), 1, 8);
+            target.resize(bar);
+          }
+          if (target.empty()) continue;
+          reinterpret_cast<SetTemplateFn>(api[11])(target.c_str());
+          rex::graphics::d3d12::RequestRenderDocGuestFrames(frames);
+          std::fprintf(stderr, "REX_RENDERDOC_CAPTURE requested=%s guest_frames=%u\n", target.c_str(),
+                       frames);
+          std::fflush(stderr);
+        }
+      }).detach();
+    }
   }
 #endif
 
@@ -1312,6 +1579,7 @@ extern "C" REX_GPU_PLUGIN_EXPORT void* rex_gpu_embedded_create(
                info->config_present,
                static_cast<unsigned long long>(info->config_contents_size),
                info->config_path_utf8);
+  rex::graphics::prompt_icons::SetBindingProvider(&PromptBindingValue);
 
   // One bounded post-override snapshot makes packaged settings provenance
   // observable without enabling per-frame diagnostics. Keep this after the
@@ -1911,6 +2179,39 @@ extern "C" REX_GPU_PLUGIN_EXPORT void rex_gpu_embedded_interrupt_timing_record(
   if (!handle) return;
   rex::graphics::cp_interrupt_timing.Add(token,
       {1, source, address, before, after, enqueue, dispatch, returned});
+}
+
+// Keyboard button prompts: the host reports the device of the latest player
+// input (1 = controller, 2 = keyboard/mouse) when it changes.
+extern "C" REX_GPU_PLUGIN_EXPORT void rex_gpu_embedded_note_input_device(void* handle,
+                                                                       uint32_t device) {
+  if (!handle || device > 2) return;
+  rex::graphics::prompt_icons::NoteInputDevice(rex::graphics::prompt_icons::Device(device));
+}
+
+// Keyboard button prompts for the host's prompt text: returns bit 0 = keyboard
+// prompts wanted now, bits 8-31 = the labels generation; writes the labels
+// as "button=label" lines (UTF-8, text spelling: arrows as words) when the
+// buffer is given and large enough (else an empty string).
+extern "C" REX_GPU_PLUGIN_EXPORT uint32_t rex_gpu_embedded_get_prompt_labels(void* handle,
+                                                                           char* buffer,
+                                                                           uint32_t size) {
+  if (buffer && size) buffer[0] = '\0';
+  if (!handle) return 0;
+  namespace prompt_icons = rex::graphics::prompt_icons;
+  const uint32_t state = (prompt_icons::KeyboardPromptsWanted() ? 1u : 0u) |
+                         (prompt_icons::LabelsGeneration() << 8);
+  if (buffer && size) {
+    std::string text;
+    for (const prompt_icons::ButtonLabel& label : prompt_icons::CurrentLabels()) {
+      text += std::string(label.button) + "=" +
+              prompt_icons::TextKeyLabel(PromptBindingValue(label.button)) + "\n";
+    }
+    if (text.size() < size) {
+      std::memcpy(buffer, text.c_str(), text.size() + 1);
+    }
+  }
+  return state;
 }
 
 extern "C" REX_GPU_PLUGIN_EXPORT void rex_gpu_embedded_note_input_transition(

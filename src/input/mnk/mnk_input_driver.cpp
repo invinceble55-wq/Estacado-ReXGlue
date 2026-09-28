@@ -54,10 +54,12 @@ REXCVAR_DEFINE_STRING(input_mouse_look, "native", "Input",
                       "stick (right-stick bridge)")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
-REXCVAR_DEFINE_STRING(input_bind_a, "Space", "Input/Keybinds/Controller", "A button");
+// The Darkness: A = use, Y = jump; use on E and jump on Space like most PC
+// games (Estacado 0.9.1; 0.9.0 had A on Space and Y on E).
+REXCVAR_DEFINE_STRING(input_bind_a, "E", "Input/Keybinds/Controller", "A button");
 REXCVAR_DEFINE_STRING(input_bind_b, "Shift", "Input/Keybinds/Controller", "B button");
 REXCVAR_DEFINE_STRING(input_bind_x, "R", "Input/Keybinds/Controller", "X button");
-REXCVAR_DEFINE_STRING(input_bind_y, "E", "Input/Keybinds/Controller", "Y button");
+REXCVAR_DEFINE_STRING(input_bind_y, "Space", "Input/Keybinds/Controller", "Y button");
 REXCVAR_DEFINE_STRING(input_bind_left_trigger, "RMB", "Input/Keybinds/Controller", "Left trigger");
 REXCVAR_DEFINE_STRING(input_bind_right_trigger, "LMB", "Input/Keybinds/Controller", "Right trigger");
 REXCVAR_DEFINE_STRING(input_bind_left_shoulder, "Q", "Input/Keybinds/Controller", "Left shoulder");

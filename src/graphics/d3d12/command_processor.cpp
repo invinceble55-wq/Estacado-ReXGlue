@@ -11,6 +11,8 @@
 
 #include <algorithm>
 #include <unordered_map>
+#include <unordered_set>
+#include <mutex>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -2222,6 +2224,17 @@ void D3D12CommandProcessor::RestoreEdramSnapshot(const void* snapshot) {
   }
   render_target_cache_->RestoreEdramSnapshot(snapshot);
 }
+
+namespace {
+std::atomic<void**> renderdoc_api{nullptr};
+std::atomic<uint32_t> renderdoc_requested_frames{0};
+// Guest swaps left in the capture in progress (command processor thread).
+uint32_t renderdoc_capture_frames_left = 0;
+}  // namespace
+
+void SetRenderDocApi(void** api) { renderdoc_api.store(api); }
+
+void RequestRenderDocGuestFrames(uint32_t frames) { renderdoc_requested_frames.store(frames); }
 
 #if REX_GPU_DIAGNOSTICS
 namespace {
@@ -5441,6 +5454,32 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   // End the frame even if did not present for any reason (the image refresher
   // was not called), to prevent leaking per-frame resources.
   EndSubmission(true);
+
+  // Measurement builds: RenderDoc captures of whole guest frames (see
+  // SetRenderDocApi), bounded by guest swaps with every earlier submission
+  // already executed.
+  if (kGpuDiagnostics) {
+    if (void** api = renderdoc_api.load()) {
+      using StartFrameCaptureFn = void(__cdecl*)(void*, void*);
+      using EndFrameCaptureFn = uint32_t(__cdecl*)(void*, void*);
+      if (renderdoc_capture_frames_left) {
+        if (!--renderdoc_capture_frames_left) {
+          DrainSubmissions();
+          const uint32_t ended = reinterpret_cast<EndFrameCaptureFn>(api[21])(nullptr, nullptr);
+          std::fprintf(stderr, "REX_RENDERDOC_GUEST_FRAMES end=%u after_swap=%llu\n", ended,
+                       static_cast<unsigned long long>(embedded_completed_swap_ordinal));
+          std::fflush(stderr);
+        }
+      } else if (const uint32_t frames = renderdoc_requested_frames.exchange(0)) {
+        DrainSubmissions();
+        reinterpret_cast<StartFrameCaptureFn>(api[19])(nullptr, nullptr);
+        renderdoc_capture_frames_left = frames;
+        std::fprintf(stderr, "REX_RENDERDOC_GUEST_FRAMES start frames=%u after_swap=%llu\n", frames,
+                     static_cast<unsigned long long>(embedded_completed_swap_ordinal));
+        std::fflush(stderr);
+      }
+    }
+  }
 }
 
 void D3D12CommandProcessor::OnPrimaryBufferEnd() {
@@ -5664,7 +5703,34 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
               fetch.dimension == xenos::DataDimension::k2DOrStacked && !fetch.stacked,
               fetch.size_2d.width + 1, fetch.size_2d.height + 1,
               uint32_t(fetch.format), uint32_t(regs.Get<reg::RB_SURFACE_INFO>().msaa_samples),
-              normalized_color_mask, normalized_depth_control.value)) continue;
+              normalized_color_mask, normalized_depth_control.value)) {
+        // A rule's own shader pair drawn with another source (size, format,
+        // MSAA, outputs): logged once per combination (#10 diagnosis).
+        if (kGpuDiagnostics) {
+          const uint64_t miss_key =
+              (uint64_t(i) << 56) ^ (uint64_t(fetch.size_2d.width) << 40) ^
+              (uint64_t(fetch.size_2d.height) << 24) ^ (uint64_t(fetch.format) << 16) ^
+              (uint64_t(regs.Get<reg::RB_SURFACE_INFO>().msaa_samples) << 12) ^
+              (uint64_t(normalized_color_mask) << 4) ^ uint64_t(fetch.type);
+          static std::mutex miss_mutex;
+          static std::unordered_set<uint64_t> misses;
+          std::lock_guard<std::mutex> miss_lock(miss_mutex);
+          if (misses.size() < 256 && misses.insert(miss_key).second) {
+            std::fprintf(stderr,
+                         "REX_NATIVE_SHADER_GRID_MISS rule=%u fetch=%u type=%u dim=%u stacked=%u "
+                         "size=%ux%u format=%u msaa=%u color_mask=0x%X depth=0x%X "
+                         "rule_size=%ux%u rule_format=%u\n",
+                         i, rule.fetch, uint32_t(fetch.type), uint32_t(fetch.dimension),
+                         uint32_t(fetch.stacked), fetch.size_2d.width + 1,
+                         fetch.size_2d.height + 1, uint32_t(fetch.format),
+                         uint32_t(regs.Get<reg::RB_SURFACE_INFO>().msaa_samples),
+                         normalized_color_mask, normalized_depth_control.value, rule.width,
+                         rule.height, rule.format);
+            std::fflush(stderr);
+          }
+        }
+        continue;
+      }
       if (rule.image_filter) {
         if (!render_target::native_shader_scale_policy::FilterSamplingSupported(
                 render_target_cache_->draw_resolution_scale_x(),

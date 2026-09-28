@@ -13,6 +13,7 @@
 
 #include <array>
 #include <functional>
+#include <future>
 #include <memory>
 #include <unordered_map>
 #include <unordered_set>
@@ -23,6 +24,7 @@
 #include <rex/graphics/d3d12/shader.h>
 #include <rex/graphics/d3d12/shared_memory.h>
 #include <rex/graphics/pipeline/texture/cache.h>
+#include <rex/graphics/pipeline/texture/prompt_icons.h>
 #include <rex/graphics/pipeline/texture/texture_pack.h>
 #include <rex/graphics/pipeline/texture/util.h>
 #include <rex/graphics/embedded_texture_readback_policy.h>
@@ -647,6 +649,33 @@ class D3D12TextureCache final : public TextureCache {
   uint64_t textures_replaced_ = 0;
   uint64_t textures_reverted_ = 0;
   uint64_t replacement_bytes_uploaded_ = 0;
+  // Keyboard button prompts (prompt_icons.h): the title's controller icon
+  // textures, recognised by their texels when loaded, show generated
+  // keycaps while keyboard prompts are wanted (the views switch at a frame
+  // start, like pack replacements; the texture's own resource stays).
+  struct PromptIconTexture {
+    int32_t icon = -1;
+    uint64_t content_id = 0;
+    // A keycap is shown (the texture's own resource waits, like a pack's).
+    bool keycap = false;
+  };
+  void EnsurePromptIconSet();
+  // Hash of the base level as linear BC blocks in host byte order (0 if the
+  // guest data is unreadable).
+  uint64_t ComputePromptIconSignature(const D3D12Texture& texture) const;
+  void NotePromptIconCandidate(D3D12Texture& texture);
+  void UpdatePromptIcons();
+  bool prompt_icon_set_loaded_ = false;
+  prompt_icons::IconSet prompt_icon_set_;
+  std::unordered_map<D3D12Texture*, PromptIconTexture> prompt_icon_textures_;
+  // Per icon, in the shader-resource state; built at the first keyboard use
+  // and again when the bindings change.
+  std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>> prompt_keycaps_;
+  uint32_t prompt_keycaps_generation_ = 0;
+  std::future<std::vector<std::shared_ptr<PreparedPackUpload>>> prompt_keycap_build_;
+  uint32_t prompt_keycap_build_generation_ = 0;
+  uint32_t prompt_keycap_failed_generation_ = 0;
+  bool prompt_keyboard_shown_ = false;
   void ProcessTextureDumps();
   std::vector<PendingTextureDump> pending_texture_dumps_;
   std::unordered_set<uint64_t> dumped_texture_ids_;

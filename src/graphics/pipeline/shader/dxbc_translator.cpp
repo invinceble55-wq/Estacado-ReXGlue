@@ -28,6 +28,12 @@ REXCVAR_DEFINE_BOOL(dxbc_switch, true, "GPU/Shader", "Use switch statements in D
 
 REXCVAR_DEFINE_BOOL(dxbc_source_map, false, "GPU/Shader", "Generate source maps for DXBC");
 
+REXCVAR_DEFINE_STRING(d3d12_shader_generator_salt, "", "GPU/Shader",
+                      "Measurement only: text added to the generator name of translated "
+                      "shaders, so the driver compiles them as never seen (first-play hitch "
+                      "measurements on a machine whose driver cache holds them); empty: off")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 namespace rex::graphics {
 using namespace ucode;
 
@@ -2071,8 +2077,13 @@ void DxbcShaderTranslator::WriteResourceDefinition() {
   // Allocate space for the header, will fill when all pointers and counts are
   // known.
   shader_object_.resize(shader_object_.size() + sizeof(dxbc::RdefHeader) / sizeof(uint32_t));
-  // Generator name.
-  dxbc::AppendAlignedString(shader_object_, "Xenia");
+  // Generator name. Measurement runs may add a salt (d3d12_shader_generator_salt)
+  // so the driver sees shaders it has never compiled: a first play on a machine
+  // whose driver shader cache already holds this game's shaders.
+  const std::string generator_salt = REXCVAR_GET(d3d12_shader_generator_salt);
+  dxbc::AppendAlignedString(shader_object_,
+                            generator_salt.empty() ? "Xenia"
+                                                   : ("Xenia " + generator_salt).c_str());
 
   // ***************************************************************************
   // Constant types

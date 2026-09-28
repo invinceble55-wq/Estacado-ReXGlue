@@ -52,7 +52,13 @@
 #include <rex/string/buffer.h>
 #include <rex/thread.h>
 #include <rex/types.h>
+#include <rex/system/xmemory.h>
 #include <rex/ui/d3d12/d3d12_util.h>
+
+#include <Windows.h>
+
+#include <chrono>
+#include <unordered_set>
 
 REXCVAR_DEFINE_BOOL(d3d12_dxbc_disasm, false, "GPU/D3D12", "Dump DXBC disassembly");
 
@@ -70,6 +76,22 @@ REXCVAR_DEFINE_BOOL(d3d12_tessellation_wireframe, false, "GPU/D3D12",
 REXCVAR_DEFINE_BOOL(d3d12_pipeline_storage_seed, true, "GPU/D3D12",
                     "Merge the packaged shader/pipeline seed (runtime_data/pipeline_seed) into "
                     "the persistent storage before preloading it")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+REXCVAR_DEFINE_BOOL(d3d12_pipeline_storage_seed_shaders, true, "GPU/D3D12",
+                    "Also merge the seed's shader microcode (false: only its pipeline "
+                    "descriptions, like a public package, which carries no microcode)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+REXCVAR_DEFINE_BOOL(d3d12_pipeline_prewarm, true, "GPU/D3D12",
+                    "Create the pipelines of the packaged shader index as soon as the game has "
+                    "created their shaders in memory, before their first draw")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+REXCVAR_DEFINE_STRING(gpu_program_cache_source, "", "GPU",
+                      "The title's compiled shader cache (System/Xenon/ProgramCache.xpc, set by "
+                      "the host): the prewarm rebuilds the packaged shader list's shaders from "
+                      "it at startup")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 REXCVAR_DEFINE_INT32(
@@ -289,10 +311,12 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
   if (seed_enabled) {
     const std::filesystem::path seed_root =
         rex::filesystem::GetExecutableFolder() / "runtime_data" / "pipeline_seed";
-    seed_shaders = pipeline_storage_seed::MergeShaders(
-        seed_root / fmt::format("{:08X}.xsh", title_id),
-        shader_storage_shareable_root / fmt::format("{:08X}.xsh", title_id),
-        ShaderStoredHeader::kVersion);
+    if (REXCVAR_GET(d3d12_pipeline_storage_seed_shaders)) {
+      seed_shaders = pipeline_storage_seed::MergeShaders(
+          seed_root / fmt::format("{:08X}.xsh", title_id),
+          shader_storage_shareable_root / fmt::format("{:08X}.xsh", title_id),
+          ShaderStoredHeader::kVersion);
+    }
     seed_pipelines = pipeline_storage_seed::MergePipelines(
         seed_root / pipeline_storage_file_path.filename(), pipeline_storage_file_path,
         edram_rov_used ? pipeline_storage_seed::kPipelineApiRov
@@ -770,6 +794,27 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
   shader_storage_cache_root_ = cache_root;
   shader_storage_title_id_ = title_id;
 
+  // Prewarm what the preload could not create: descriptions whose shaders are
+  // not stored yet (on a first start, all of the packaged ones).
+  if (REXCVAR_GET(d3d12_pipeline_prewarm)) {
+    std::vector<PipelineStoredDescription> prewarm_pending;
+    for (const PipelineStoredDescription& stored : pipeline_stored_descriptions) {
+      bool created = false;
+      auto created_range = pipelines_.equal_range(stored.description_hash);
+      for (auto it = created_range.first; it != created_range.second; ++it) {
+        if (!std::memcmp(&it->second->description.description, &stored.description,
+                         sizeof(stored.description))) {
+          created = true;
+          break;
+        }
+      }
+      if (!created) prewarm_pending.push_back(stored);
+    }
+    StartPrewarm(rex::filesystem::GetExecutableFolder() / "runtime_data" / "pipeline_seed" /
+                     fmt::format("{:08X}.xshi", title_id),
+                 prewarm_pending);
+  }
+
   // One line per start: how much the seed added and what the preload cost.
   std::fprintf(stderr,
                "REX_PIPELINE_STORAGE_PRELOAD seed=%d seed_shaders=%zu seed_shaders_added=%zu "
@@ -793,6 +838,7 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
 }
 
 void PipelineCache::ShutdownShaderStorage() {
+  StopPrewarm();
   if (storage_write_thread_) {
     {
       std::lock_guard<std::mutex> lock(storage_write_request_lock_);
@@ -822,6 +868,7 @@ void PipelineCache::ShutdownShaderStorage() {
 }
 
 void PipelineCache::EndSubmission() {
+  AdoptPrewarmedShaders();
   if (shader_storage_file_flush_needed_ || pipeline_storage_file_flush_needed_) {
     {
       std::lock_guard<std::mutex> lock(storage_write_request_lock_);
@@ -836,6 +883,8 @@ void PipelineCache::EndSubmission() {
     shader_storage_file_flush_needed_ = false;
     pipeline_storage_file_flush_needed_ = false;
   }
+  // The time this submission waits for pipeline creation (a hitch when long).
+  const uint64_t creation_wait_start = rex::chrono::Clock::QueryHostTickCount();
   if (!creation_threads_.empty()) {
     CreateQueuedPipelinesOnProcessorThread();
     // Await creation of all queued pipelines.
@@ -856,6 +905,17 @@ void PipelineCache::EndSubmission() {
       rex::thread::Wait(creation_completion_event_.get(), false);
     }
   }
+  AwaitClaimedPrewarmPipelines();
+  const uint64_t creation_wait_us =
+      (rex::chrono::Clock::QueryHostTickCount() - creation_wait_start) * 1000000 /
+      rex::chrono::Clock::QueryHostTickFrequency();
+  if (creation_wait_us >= 500) {
+    ++creation_waits_;
+    creation_wait_us_total_ += creation_wait_us;
+    creation_wait_us_max_ = std::max(creation_wait_us_max_, creation_wait_us);
+    if (creation_wait_us >= 16000) ++creation_waits_over_16ms_;
+  }
+  ReportPipelineUse();
 }
 
 bool PipelineCache::IsCreatingPipelines() {
@@ -1097,6 +1157,9 @@ bool PipelineCache::ConfigurePipeline(
     if (!std::memcmp(&found_pipeline->description.description, &description, sizeof(description))) {
       PROFILE_PIPELINE_CACHE_HIT();
       if (kGpuDiagnostics) ++telemetry_cache_hits_;
+      if (found_pipeline->prewarm.load(std::memory_order_acquire) != kPrewarmNone) {
+        ClaimPrewarmPipeline(found_pipeline);
+      }
       current_pipeline_ = found_pipeline;
       *pipeline_handle_out = found_pipeline;
       *root_signature_out = found_pipeline->root_signature.load(std::memory_order_acquire);
@@ -1105,6 +1168,7 @@ bool PipelineCache::ConfigurePipeline(
   }
   PROFILE_PIPELINE_CACHE_MISS();
   if (kGpuDiagnostics) ++telemetry_cache_misses_;
+  ++draw_created_pipelines_;
 
   Pipeline* new_pipeline = new Pipeline;
   std::memcpy(&new_pipeline->description, &runtime_description, sizeof(runtime_description));
@@ -3495,6 +3559,539 @@ void PipelineCache::CreateQueuedPipelinesOnProcessorThread() {
       telemetry_async_failed_.fetch_add(1, std::memory_order_relaxed);
     }
   }
+}
+
+// --- Shader prewarm (Estacado 0.9.1, #5; pipeline_cache.h) -------------------
+
+namespace {
+constexpr size_t kPrewarmFilterBits = size_t(1) << 20;
+constexpr size_t kPrewarmPhysicalBytes = size_t(512) << 20;
+constexpr size_t kPrewarmChunkBytes = size_t(64) << 10;
+// Microcode is recognised across a chunk end up to this length.
+constexpr size_t kPrewarmMaxShaderBytes = size_t(64) << 10;
+
+// Process-wide progress for the presenter's indicator (GetShaderPrewarmStatus).
+std::atomic<uint32_t> g_prewarm_status_queued{0};
+std::atomic<uint32_t> g_prewarm_status_handled{0};
+
+struct PrewarmPrefixLess {
+  bool operator()(const pipeline_storage_seed::ShaderIndexEntry& entry, uint64_t prefix) const {
+    return entry.prefix_hash < prefix;
+  }
+  bool operator()(uint64_t prefix, const pipeline_storage_seed::ShaderIndexEntry& entry) const {
+    return prefix < entry.prefix_hash;
+  }
+};
+}  // namespace
+
+ShaderPrewarmStatus GetShaderPrewarmStatus() {
+  return {g_prewarm_status_queued.load(std::memory_order_relaxed),
+          g_prewarm_status_handled.load(std::memory_order_relaxed)};
+}
+
+void PipelineCache::StartPrewarm(const std::filesystem::path& index_path,
+                                 const std::vector<PipelineStoredDescription>& pending) {
+  StopPrewarm();
+  std::vector<uint8_t> data;
+  std::vector<pipeline_storage_seed::ShaderIndexEntry> entries;
+  if (pending.empty() || !command_processor_.guest_memory() ||
+      !pipeline_storage_seed::ReadWholeFile(index_path, data) ||
+      !pipeline_storage_seed::ParseShaderIndex(data, ShaderStoredHeader::kVersion, entries)) {
+    return;
+  }
+  prewarm_modifications_.clear();
+  const auto need = [this](uint64_t hash, uint64_t modification) {
+    std::vector<uint64_t>& modifications = prewarm_modifications_[hash];
+    if (std::find(modifications.begin(), modifications.end(), modification) ==
+        modifications.end()) {
+      modifications.push_back(modification);
+    }
+  };
+  for (const PipelineStoredDescription& stored : pending) {
+    need(stored.description.vertex_shader_hash, stored.description.vertex_shader_modification);
+    if (stored.description.pixel_shader_hash) {
+      need(stored.description.pixel_shader_hash, stored.description.pixel_shader_modification);
+    }
+  }
+  prewarm_index_.clear();
+  for (const pipeline_storage_seed::ShaderIndexEntry& entry : entries) {
+    // A replaced shader is loaded under its replacement's hash (LoadShader).
+    uint64_t effective_hash = entry.ucode_hash;
+    if (const ShaderReplacement* replacement =
+            FindConfiguredShaderReplacement(xenos::ShaderType(entry.type), entry.ucode_hash)) {
+      effective_hash = replacement->replacement_hash;
+    }
+    if (shaders_.count(effective_hash) || !prewarm_modifications_.count(effective_hash)) continue;
+    prewarm_index_.push_back(entry);
+  }
+  if (prewarm_index_.empty()) return;
+  std::sort(prewarm_index_.begin(), prewarm_index_.end(),
+            [](const pipeline_storage_seed::ShaderIndexEntry& a,
+               const pipeline_storage_seed::ShaderIndexEntry& b) {
+              return a.prefix_hash < b.prefix_hash;
+            });
+  prewarm_prefix_filter_.assign(kPrewarmFilterBits / 64, 0);
+  for (const pipeline_storage_seed::ShaderIndexEntry& entry : prewarm_index_) {
+    const uint64_t bit = entry.prefix_hash & (kPrewarmFilterBits - 1);
+    prewarm_prefix_filter_[bit >> 6] |= uint64_t(1) << (bit & 63);
+  }
+  prewarm_pending_ = pending;
+  // The rebuild list next to the index and the title's ProgramCache: the
+  // wanted shaders they rebuild need not wait for the game to create them.
+  prewarm_rebuild_.clear();
+  prewarm_program_cache_.clear();
+  std::vector<uint8_t> patch_data;
+  std::vector<pipeline_storage_seed::ShaderPatchEntry> patches;
+  const std::string& program_cache = REXCVAR_GET(gpu_program_cache_source);
+  if (!program_cache.empty() &&
+      pipeline_storage_seed::ReadWholeFile(std::filesystem::path(index_path).replace_extension(".xshp"),
+                                           patch_data) &&
+      pipeline_storage_seed::ParseShaderPatches(patch_data, ShaderStoredHeader::kVersion,
+                                                patches) &&
+      pipeline_storage_seed::ReadWholeFile(std::filesystem::u8path(program_cache),
+                                           prewarm_program_cache_)) {
+    std::unordered_set<uint64_t> wanted;
+    for (const pipeline_storage_seed::ShaderIndexEntry& entry : prewarm_index_) {
+      wanted.insert(entry.ucode_hash);
+    }
+    for (pipeline_storage_seed::ShaderPatchEntry& patch : patches) {
+      if (wanted.count(patch.runtime_hash)) prewarm_rebuild_.push_back(std::move(patch));
+    }
+  }
+  if (prewarm_rebuild_.empty()) prewarm_program_cache_.clear();
+  {
+    std::lock_guard<std::mutex> lock(prewarm_lock_);
+    prewarm_shutdown_ = false;
+  }
+  prewarm_shaders_found_.store(0, std::memory_order_relaxed);
+  prewarm_pipelines_queued_.store(0, std::memory_order_relaxed);
+  prewarm_pipelines_created_.store(0, std::memory_order_relaxed);
+  prewarm_shaders_adopted_ = 0;
+  prewarm_pipelines_claimed_ = 0;
+  prewarm_scan_thread_ = rex::thread::Thread::Create({}, [this]() { PrewarmScanThread(); });
+  if (prewarm_scan_thread_) {
+    prewarm_scan_thread_->set_name("D3D12 Shader prewarm");
+    prewarm_scan_thread_->set_priority(rex::thread::ThreadPriority::kBelowNormal);
+  }
+  const size_t creation_count = rex::thread::logical_processor_count() >= 8 ? 2 : 1;
+  for (size_t i = 0; i < creation_count; ++i) {
+    std::unique_ptr<rex::thread::Thread> thread =
+        rex::thread::Thread::Create({}, [this]() { PrewarmCreationThread(); });
+    if (!thread) break;
+    thread->set_name("D3D12 Prewarm pipelines");
+    thread->set_priority(rex::thread::ThreadPriority::kBelowNormal);
+    prewarm_creation_threads_.push_back(std::move(thread));
+  }
+  std::fprintf(stderr,
+               "REX_PIPELINE_PREWARM started index_shaders=%zu wanted_shaders=%zu "
+               "pending_pipelines=%zu creation_threads=%zu rebuild_list=%zu\n",
+               entries.size(), prewarm_index_.size(), prewarm_pending_.size(),
+               prewarm_creation_threads_.size(), prewarm_rebuild_.size());
+  std::fflush(stderr);
+}
+
+void PipelineCache::StopPrewarm() {
+  {
+    std::lock_guard<std::mutex> lock(prewarm_lock_);
+    prewarm_shutdown_ = true;
+  }
+  prewarm_cond_.notify_all();
+  if (prewarm_scan_thread_) {
+    rex::thread::Wait(prewarm_scan_thread_.get(), false);
+    prewarm_scan_thread_.reset();
+  }
+  for (std::unique_ptr<rex::thread::Thread>& thread : prewarm_creation_threads_) {
+    rex::thread::Wait(thread.get(), false);
+  }
+  prewarm_creation_threads_.clear();
+  std::lock_guard<std::mutex> lock(prewarm_lock_);
+  for (D3D12Shader* shader : prewarm_ready_) delete shader;
+  prewarm_ready_.clear();
+  // Pipelines still queued stay in pipelines_ as kPrewarmQueued: a draw that
+  // needs one takes it over (ClaimPrewarmPipeline).
+  g_prewarm_status_handled.fetch_add(uint32_t(prewarm_creation_queue_.size()),
+                                     std::memory_order_relaxed);
+  prewarm_creation_queue_.clear();
+  prewarm_claimed_creating_.clear();
+  prewarm_pending_.clear();
+  prewarm_index_.clear();
+  prewarm_prefix_filter_.clear();
+  prewarm_modifications_.clear();
+  prewarm_rebuild_.clear();
+  prewarm_program_cache_.clear();
+}
+
+void PipelineCache::PrewarmScanThread() {
+  const uint8_t* physical = command_processor_.guest_memory()->physical_membase();
+  const ui::d3d12::D3D12Provider& provider = command_processor_.GetD3D12Provider();
+  const bool edram_rov_used =
+      render_target_cache_.GetPath() == RenderTargetCache::Path::kPixelShaderInterlock;
+  DxbcShaderTranslator translator(
+      provider.GetAdapterVendorID(), bindless_resources_used_, edram_rov_used,
+      !render_target_cache_.gamma_render_target_as_unorm16(),
+      render_target_cache_.msaa_2x_supported(), render_target_cache_.draw_resolution_scale_x(),
+      render_target_cache_.draw_resolution_scale_y(), provider.GetGraphicsAnalysis() != nullptr);
+  string::StringBuffer ucode_disasm_buffer;
+  std::vector<uint8_t> chunk(kPrewarmChunkBytes + kPrewarmMaxShaderBytes);
+  std::unordered_set<uint64_t> found;
+  // Translates a shader of the index (its microcode verified) for the
+  // modifications the pending descriptions need and hands it to the
+  // processor thread.
+  const auto prepare = [&](xenos::ShaderType type, uint64_t hash, const uint32_t* ucode,
+                           uint32_t dword_count) {
+    if (const ShaderReplacement* replacement =
+            FindConfiguredShaderReplacement(type, hash, ucode, dword_count)) {
+      ucode = replacement->ucode.data();
+      dword_count = uint32_t(replacement->ucode.size());
+      hash = replacement->replacement_hash;
+    }
+    const auto modifications = prewarm_modifications_.find(hash);
+    if (modifications == prewarm_modifications_.end()) return false;
+    D3D12Shader* shader = new D3D12Shader(type, hash, ucode, dword_count);
+    shader->AnalyzeUcode(ucode_disasm_buffer);
+    for (uint64_t modification : modifications->second) {
+      auto* translation = static_cast<D3D12Shader::D3D12Translation*>(
+          shader->GetOrCreateTranslation(modification));
+      if (!translation->is_translated()) TranslateAnalyzedShader(translator, *translation);
+    }
+    {
+      std::lock_guard<std::mutex> lock(prewarm_lock_);
+      prewarm_ready_.push_back(shader);
+    }
+    prewarm_shaders_found_.fetch_add(1, std::memory_order_relaxed);
+    return true;
+  };
+  // First the shaders the title's ProgramCache rebuilds: source microcode by
+  // hash, the vertex-fetch dwords patched in, the result verified against the
+  // index hash.
+  if (!prewarm_rebuild_.empty()) {
+    const uint64_t rebuild_start = rex::chrono::Clock::QueryHostTickCount();
+    std::unordered_map<uint64_t, pipeline_storage_seed::ProgramCacheShader> sources;
+    for (const pipeline_storage_seed::ProgramCacheShader& source :
+         pipeline_storage_seed::ParseProgramCache(prewarm_program_cache_)) {
+      sources.emplace(XXH3_64bits(prewarm_program_cache_.data() + source.offset, source.bytes),
+                      source);
+    }
+    size_t rebuilt = 0;
+    size_t mismatched = 0;
+    std::vector<uint32_t> ucode;
+    for (const pipeline_storage_seed::ShaderPatchEntry& entry : prewarm_rebuild_) {
+      {
+        std::lock_guard<std::mutex> lock(prewarm_lock_);
+        if (prewarm_shutdown_) return;
+      }
+      const auto source = sources.find(entry.source_hash);
+      if (source == sources.end() || source->second.type != entry.type ||
+          source->second.bytes != entry.dword_count * sizeof(uint32_t)) {
+        ++mismatched;
+        continue;
+      }
+      ucode.resize(entry.dword_count);
+      std::memcpy(ucode.data(), prewarm_program_cache_.data() + source->second.offset,
+                  source->second.bytes);
+      for (const auto& [index, xor_mask] : entry.patches) ucode[index] ^= xor_mask;
+      if (XXH3_64bits(ucode.data(), source->second.bytes) != entry.runtime_hash) {
+        ++mismatched;
+        continue;
+      }
+      if (prepare(xenos::ShaderType(entry.type), entry.runtime_hash, ucode.data(),
+                  entry.dword_count)) {
+        found.insert(entry.runtime_hash);
+        ++rebuilt;
+      }
+    }
+    std::fprintf(stderr,
+                 "REX_PIPELINE_PREWARM rebuilt=%zu of=%zu mismatched=%zu program_cache_shaders=%zu "
+                 "rebuild_ms=%llu\n",
+                 rebuilt, prewarm_rebuild_.size(), mismatched, sources.size(),
+                 static_cast<unsigned long long>(
+                     (rex::chrono::Clock::QueryHostTickCount() - rebuild_start) * 1000 /
+                     rex::chrono::Clock::QueryHostTickFrequency()));
+    std::fflush(stderr);
+    if (found.size() >= prewarm_index_.size()) return;
+  }
+  const HANDLE process = GetCurrentProcess();
+  uint32_t quiet_scans = 0;
+  uint64_t scans = 0;
+  for (;;) {
+    {
+      // Every second while shaders keep appearing, then every four seconds.
+      std::unique_lock<std::mutex> lock(prewarm_lock_);
+      if (prewarm_cond_.wait_for(lock,
+                                 std::chrono::milliseconds(quiet_scans < 30 ? 1000 : 4000),
+                                 [this]() { return prewarm_shutdown_; })) {
+        return;
+      }
+    }
+    const uint64_t scan_start = rex::chrono::Clock::QueryHostTickCount();
+    size_t found_now = 0;
+    for (size_t base = 0; base < kPrewarmPhysicalBytes; base += kPrewarmChunkBytes) {
+      // The guest may be writing or freeing any of this: ReadProcessMemory
+      // copies what is readable now (never faults), and every match is
+      // checked against the full microcode hash.
+      SIZE_T read = 0;
+      const size_t want = std::min(chunk.size(), kPrewarmPhysicalBytes - base);
+      if (!ReadProcessMemory(process, physical + base, chunk.data(), want, &read)) {
+        read = 0;
+        if (!ReadProcessMemory(process, physical + base, chunk.data(), kPrewarmChunkBytes,
+                               &read)) {
+          continue;
+        }
+      }
+      const size_t limit = std::min<size_t>(kPrewarmChunkBytes, read);
+      for (size_t at = 0; at + pipeline_storage_seed::kIndexPrefixBytes <= limit; at += 32) {
+        const uint8_t* bytes = chunk.data() + at;
+        uint64_t head[2];
+        std::memcpy(head, bytes, sizeof(head));
+        if (!(head[0] | head[1])) continue;
+        const uint64_t prefix = XXH3_64bits(bytes, pipeline_storage_seed::kIndexPrefixBytes);
+        const uint64_t bit = prefix & (kPrewarmFilterBits - 1);
+        if (!(prewarm_prefix_filter_[bit >> 6] & (uint64_t(1) << (bit & 63)))) continue;
+        const auto range = std::equal_range(prewarm_index_.begin(), prewarm_index_.end(), prefix,
+                                            PrewarmPrefixLess{});
+        for (auto entry = range.first; entry != range.second; ++entry) {
+          const size_t ucode_bytes = size_t(entry->dword_count) * sizeof(uint32_t);
+          if (found.count(entry->ucode_hash) || at + ucode_bytes > read ||
+              XXH3_64bits(bytes, ucode_bytes) != entry->ucode_hash) {
+            continue;
+          }
+          found.insert(entry->ucode_hash);
+          if (prepare(xenos::ShaderType(entry->type), entry->ucode_hash,
+                      reinterpret_cast<const uint32_t*>(bytes), entry->dword_count)) {
+            ++found_now;
+          }
+        }
+      }
+      if (!(base & ((size_t(32) << 20) - 1))) {
+        std::lock_guard<std::mutex> lock(prewarm_lock_);
+        if (prewarm_shutdown_) return;
+      }
+    }
+    ++scans;
+    quiet_scans = found_now ? 0 : quiet_scans + 1;
+    if (found_now || scans == 1) {
+      const uint64_t scan_ms = (rex::chrono::Clock::QueryHostTickCount() - scan_start) * 1000 /
+                               rex::chrono::Clock::QueryHostTickFrequency();
+      std::fprintf(stderr,
+                   "REX_PIPELINE_PREWARM scan=%llu found=%zu found_total=%zu of=%zu scan_ms=%llu\n",
+                   static_cast<unsigned long long>(scans), found_now, found.size(),
+                   prewarm_index_.size(), static_cast<unsigned long long>(scan_ms));
+      std::fflush(stderr);
+    }
+    if (found.size() >= prewarm_index_.size()) return;
+  }
+}
+
+void PipelineCache::PrewarmCreationThread() {
+  for (;;) {
+    Pipeline* pipeline;
+    {
+      std::unique_lock<std::mutex> lock(prewarm_lock_);
+      prewarm_cond_.wait(lock, [this]() {
+        return prewarm_shutdown_ || !prewarm_creation_queue_.empty();
+      });
+      if (prewarm_shutdown_) return;
+      pipeline = prewarm_creation_queue_.front();
+      prewarm_creation_queue_.pop_front();
+    }
+    uint8_t expected = kPrewarmQueued;
+    if (!pipeline->prewarm.compare_exchange_strong(expected, kPrewarmCreating,
+                                                   std::memory_order_acq_rel)) {
+      continue;  // a draw took it over
+    }
+    PipelineRuntimeDescription runtime_description;
+    std::memcpy(&runtime_description, &pipeline->description, sizeof(runtime_description));
+    runtime_description.root_signature = pipeline->root_signature.load(std::memory_order_acquire);
+    pipeline->state.store(CreateD3D12Pipeline(runtime_description), std::memory_order_release);
+    {
+      std::lock_guard<std::mutex> lock(prewarm_lock_);
+      pipeline->prewarm.store(kPrewarmDone, std::memory_order_release);
+    }
+    prewarm_pipelines_created_.fetch_add(1, std::memory_order_relaxed);
+    g_prewarm_status_handled.fetch_add(1, std::memory_order_relaxed);
+    prewarm_cond_.notify_all();
+  }
+}
+
+void PipelineCache::AdoptPrewarmedShaders() {
+  std::vector<D3D12Shader*> ready;
+  {
+    std::lock_guard<std::mutex> lock(prewarm_lock_);
+    if (prewarm_ready_.empty()) return;
+    ready.swap(prewarm_ready_);
+  }
+  for (D3D12Shader* shader : ready) {
+    if (shaders_.count(shader->ucode_data_hash())) {
+      delete shader;  // a draw loaded it meanwhile
+      continue;
+    }
+    shaders_.emplace(shader->ucode_data_hash(), shader);
+    ++prewarm_shaders_adopted_;
+    // Stored like a drawn shader, so the next start preloads it.
+    if (shader_storage_file_ && shader->ucode_storage_index() != shader_storage_index_) {
+      shader->set_ucode_storage_index(shader_storage_index_);
+      shader_storage_file_flush_needed_ = true;
+      {
+        std::lock_guard<std::mutex> storage_lock(storage_write_request_lock_);
+        storage_write_shader_queue_.push_back(shader);
+      }
+      storage_write_request_cond_.notify_all();
+    }
+  }
+  const auto translation_of = [this](uint64_t hash,
+                                     uint64_t modification) -> D3D12Shader::D3D12Translation* {
+    const auto shader = shaders_.find(hash);
+    if (shader == shaders_.end()) return nullptr;
+    auto* translation =
+        static_cast<D3D12Shader::D3D12Translation*>(shader->second->GetTranslation(modification));
+    return translation && translation->is_translated() && translation->is_valid() ? translation
+                                                                                  : nullptr;
+  };
+  size_t queued = 0;
+  for (size_t i = 0; i < prewarm_pending_.size();) {
+    const PipelineStoredDescription& stored = prewarm_pending_[i];
+    const PipelineDescription& description = stored.description;
+    D3D12Shader::D3D12Translation* vertex_shader =
+        translation_of(description.vertex_shader_hash, description.vertex_shader_modification);
+    D3D12Shader::D3D12Translation* pixel_shader =
+        description.pixel_shader_hash
+            ? translation_of(description.pixel_shader_hash, description.pixel_shader_modification)
+            : nullptr;
+    if (!vertex_shader || (description.pixel_shader_hash && !pixel_shader)) {
+      ++i;
+      continue;
+    }
+    bool exists = false;
+    auto existing = pipelines_.equal_range(stored.description_hash);
+    for (auto it = existing.first; it != existing.second; ++it) {
+      if (!std::memcmp(&it->second->description.description, &description,
+                       sizeof(description))) {
+        exists = true;  // a draw created it meanwhile
+        break;
+      }
+    }
+    if (!exists) {
+      // As the storage preload creates a stored pipeline.
+      PipelineRuntimeDescription runtime_description;
+      runtime_description.vertex_shader = vertex_shader;
+      runtime_description.pixel_shader = pixel_shader;
+      GeometryShaderKey geometry_shader_key;
+      runtime_description.geometry_shader =
+          GetGeometryShaderKey(
+              description.geometry_shader,
+              DxbcShaderTranslator::Modification(description.vertex_shader_modification),
+              DxbcShaderTranslator::Modification(description.pixel_shader_modification),
+              geometry_shader_key)
+              ? &GetGeometryShader(geometry_shader_key)
+              : nullptr;
+      runtime_description.root_signature = command_processor_.GetRootSignature(
+          static_cast<D3D12Shader*>(&vertex_shader->shader()),
+          pixel_shader ? static_cast<D3D12Shader*>(&pixel_shader->shader()) : nullptr,
+          Shader::IsHostVertexShaderTypeDomain(
+              DxbcShaderTranslator::Modification(description.vertex_shader_modification)
+                  .vertex.host_vertex_shader_type));
+      if (runtime_description.root_signature) {
+        std::memcpy(&runtime_description.description, &description, sizeof(description));
+        Pipeline* pipeline = new Pipeline;
+        std::memcpy(&pipeline->description, &runtime_description, sizeof(runtime_description));
+        pipeline->root_signature.store(runtime_description.root_signature,
+                                       std::memory_order_release);
+        uint32_t bound_rts = 0;
+        for (uint32_t rt = 0; rt < xenos::kMaxColorRenderTargets; ++rt) {
+          if (description.render_targets[rt].used) bound_rts |= uint32_t(1) << rt;
+        }
+        pipeline->priority = pipeline_util::CalculatePipelinePriority(
+            bound_rts, pixel_shader ? pixel_shader->shader().writes_color_targets() : 0,
+            pixel_shader ? pixel_shader->shader().writes_depth() : description.depth_write != 0);
+        pipeline->prewarm.store(kPrewarmQueued, std::memory_order_release);
+        pipelines_.emplace(stored.description_hash, pipeline);
+        COUNT_profile_set("gpu/pipeline_cache/pipelines", pipelines_.size());
+        {
+          std::lock_guard<std::mutex> lock(prewarm_lock_);
+          prewarm_creation_queue_.push_back(pipeline);
+        }
+        ++queued;
+      }
+    }
+    prewarm_pending_[i] = prewarm_pending_.back();
+    prewarm_pending_.pop_back();
+  }
+  if (queued) {
+    prewarm_pipelines_queued_.fetch_add(uint32_t(queued), std::memory_order_relaxed);
+    g_prewarm_status_queued.fetch_add(uint32_t(queued), std::memory_order_relaxed);
+    prewarm_cond_.notify_all();
+  }
+}
+
+void PipelineCache::ClaimPrewarmPipeline(Pipeline* pipeline) {
+  uint8_t state = pipeline->prewarm.load(std::memory_order_acquire);
+  if (state == kPrewarmQueued &&
+      pipeline->prewarm.compare_exchange_strong(state, kPrewarmClaimed,
+                                                std::memory_order_acq_rel)) {
+    // Not started yet: created like any pipeline a draw needs (EndSubmission
+    // creates or awaits it).
+    ++prewarm_pipelines_claimed_;
+    g_prewarm_status_handled.fetch_add(1, std::memory_order_relaxed);
+    if (!creation_threads_.empty()) {
+      {
+        std::lock_guard<std::mutex> lock(creation_request_lock_);
+        creation_queue_.push(pipeline);
+      }
+      creation_request_cond_.notify_one();
+    } else {
+      PipelineRuntimeDescription runtime_description;
+      std::memcpy(&runtime_description, &pipeline->description, sizeof(runtime_description));
+      runtime_description.root_signature =
+          pipeline->root_signature.load(std::memory_order_acquire);
+      pipeline->state.store(CreateD3D12Pipeline(runtime_description), std::memory_order_release);
+    }
+    return;
+  }
+  if (state == kPrewarmCreating &&
+      std::find(prewarm_claimed_creating_.begin(), prewarm_claimed_creating_.end(), pipeline) ==
+          prewarm_claimed_creating_.end()) {
+    prewarm_claimed_creating_.push_back(pipeline);
+  }
+}
+
+void PipelineCache::AwaitClaimedPrewarmPipelines() {
+  if (prewarm_claimed_creating_.empty()) return;
+  std::unique_lock<std::mutex> lock(prewarm_lock_);
+  prewarm_cond_.wait(lock, [this]() {
+    for (const Pipeline* pipeline : prewarm_claimed_creating_) {
+      if (pipeline->prewarm.load(std::memory_order_acquire) != kPrewarmDone) return false;
+    }
+    return true;
+  });
+  prewarm_claimed_creating_.clear();
+}
+
+void PipelineCache::ReportPipelineUse() {
+  // At most every five seconds, and only when something changed.
+  const uint64_t now = rex::chrono::Clock::QueryHostTickCount();
+  if (now - reported_pipeline_use_tick_ < rex::chrono::Clock::QueryHostTickFrequency() * 5) {
+    return;
+  }
+  const uint64_t signature =
+      draw_created_pipelines_ ^ (uint64_t(prewarm_shaders_adopted_) << 20) ^
+      (uint64_t(prewarm_pipelines_created_.load(std::memory_order_relaxed)) << 40) ^
+      (uint64_t(prewarm_pipelines_claimed_) << 52) ^ (creation_waits_ << 30);
+  if (signature == reported_draw_created_pipelines_) return;
+  reported_draw_created_pipelines_ = signature;
+  reported_pipeline_use_tick_ = now;
+  std::fprintf(stderr,
+               "REX_PIPELINE_USE draw_created=%llu waits=%llu wait_ms=%.1f wait_max_ms=%.1f "
+               "waits_16ms=%llu prewarm_found=%u prewarm_adopted=%u prewarm_queued=%u "
+               "prewarm_created=%u prewarm_claimed=%u\n",
+               static_cast<unsigned long long>(draw_created_pipelines_),
+               static_cast<unsigned long long>(creation_waits_), creation_wait_us_total_ / 1000.0,
+               creation_wait_us_max_ / 1000.0,
+               static_cast<unsigned long long>(creation_waits_over_16ms_),
+               prewarm_shaders_found_.load(std::memory_order_relaxed), prewarm_shaders_adopted_,
+               prewarm_pipelines_queued_.load(std::memory_order_relaxed),
+               prewarm_pipelines_created_.load(std::memory_order_relaxed),
+               prewarm_pipelines_claimed_);
+  std::fflush(stderr);
 }
 
 PipelineCache::TelemetrySnapshot PipelineCache::GetTelemetrySnapshot() {

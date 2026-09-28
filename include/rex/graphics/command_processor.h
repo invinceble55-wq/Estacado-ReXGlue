@@ -123,6 +123,8 @@ class CommandProcessor {
 
   Shader* active_vertex_shader() const { return active_vertex_shader_; }
   Shader* active_pixel_shader() const { return active_pixel_shader_; }
+  // Guest memory (read-only users such as the D3D12 shader prewarm).
+  memory::Memory* guest_memory() const { return memory_; }
 
   virtual bool Initialize();
   virtual void Shutdown();

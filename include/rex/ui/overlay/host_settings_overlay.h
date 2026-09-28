@@ -61,10 +61,13 @@ class HostSettingsOverlayDialog : public ImGuiDialog {
  public:
   using LiveCallback = std::function<void(const settings::Setting&, const std::string&)>;
   using CloseCallback = std::function<void()>;
+  using QuitCallback = std::function<void()>;
 
+  // `quit` (optional) adds a "Quit game" button beside Resume; after the
+  // player confirms, it asks the owner to end the game (djanice1980, #7).
   HostSettingsOverlayDialog(ImGuiDrawer* imgui_drawer, HostSettingsState& state, ImFont* font,
                             std::string toggle_key_name, LiveCallback live,
-                            CloseCallback close);
+                            CloseCallback close, QuitCallback quit = nullptr);
   ~HostSettingsOverlayDialog() override;
 
   // A key editor waits for a key: Escape is then a binding, not "close".
@@ -82,6 +85,7 @@ class HostSettingsOverlayDialog : public ImGuiDialog {
   std::string toggle_key_name_;
   LiveCallback live_;
   CloseCallback close_;
+  QuitCallback quit_;
   settings::PanelModel model_;
   settings::Schema schema_;
   std::string status_;

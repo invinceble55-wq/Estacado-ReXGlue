@@ -26,6 +26,7 @@
 #include <vector>
 
 #include <rex/assert.h>
+#include <rex/graphics/d3d12/pipeline_storage_seed.h>
 #include <rex/graphics/d3d12/render_target_cache.h>
 #include <rex/graphics/d3d12/shader.h>
 #include <rex/graphics/flags.h>
@@ -43,6 +44,15 @@
 namespace rex::graphics::d3d12 {
 
 class D3D12CommandProcessor;
+
+// Shader prewarm progress of this process (any thread): pipelines queued so
+// far and pipelines handled (created, or taken over by a draw). The
+// presenter's indicator shows the difference while it is not zero.
+struct ShaderPrewarmStatus {
+  uint32_t queued = 0;
+  uint32_t handled = 0;
+};
+ShaderPrewarmStatus GetShaderPrewarmStatus();
 
 class PipelineCache {
  public:
@@ -108,6 +118,17 @@ class PipelineCache {
     uint64_t queue_depth = 0;
     uint64_t threads_busy = 0;
   };
+
+  // Shader prewarm progress for the presenter's indicator: pipelines the
+  // prewarm queued and created so far (0/0 when it has nothing to do).
+  struct PrewarmProgress {
+    uint32_t queued = 0;
+    uint32_t created = 0;
+  };
+  PrewarmProgress GetPrewarmProgress() const {
+    return {prewarm_pipelines_queued_.load(std::memory_order_relaxed),
+            prewarm_pipelines_created_.load(std::memory_order_relaxed)};
+  }
 
   // Cumulative, low-cost counters. The command processor samples these once
   // per embedded frame and computes deltas, avoiding per-pipeline text output.
@@ -364,6 +385,14 @@ class PipelineCache {
   // Xenos pixel shader provided.
   std::vector<uint8_t> depth_only_pixel_shader_;
 
+  // Prewarm states of a pipeline (Pipeline::prewarm).
+  enum : uint8_t {
+    kPrewarmNone = 0,  // created for a draw or from the storage
+    kPrewarmQueued,    // waiting in prewarm_creation_queue_
+    kPrewarmCreating,  // a prewarm thread is creating it
+    kPrewarmDone,      // created by a prewarm thread
+    kPrewarmClaimed,   // a draw took it over from the prewarm queue
+  };
   struct Pipeline {
     // nullptr if creation has failed.
     std::atomic<ID3D12PipelineState*> state{nullptr};
@@ -372,6 +401,7 @@ class PipelineCache {
     D3D12Shader::D3D12Translation* pending_vertex_shader = nullptr;
     D3D12Shader::D3D12Translation* pending_pixel_shader = nullptr;
     uint8_t priority = 0;
+    std::atomic<uint8_t> prewarm{kPrewarmNone};
   };
   struct PipelineCreationPriorityComparator {
     bool operator()(const Pipeline* a, const Pipeline* b) const {
@@ -451,6 +481,64 @@ class PipelineCache {
   uint64_t telemetry_sync_created_ = 0;
   std::atomic<uint64_t> telemetry_async_completed_{0};
   std::atomic<uint64_t> telemetry_async_failed_{0};
+
+  // Prewarm (Estacado 0.9.1, #5). The game builds most of its shaders at run
+  // time, so no game file holds their microcode. The packaged shader index
+  // (pipeline_storage_seed.h, no microcode) names the shaders the stored
+  // pipeline descriptions need; a scan thread recognises them in guest
+  // physical memory once the game has created them (typically while a level
+  // loads), translates them and hands them to the processor thread, which
+  // adopts them at EndSubmission and queues the pipelines whose shaders are
+  // all present on prewarm creation threads, before their first draw. A draw
+  // that needs a pipeline still in that queue takes it over (normal creation);
+  // one being created is awaited at EndSubmission. Found shaders also go to
+  // the shader storage, so the next start preloads them.
+  void StartPrewarm(const std::filesystem::path& index_path,
+                    const std::vector<PipelineStoredDescription>& stored_descriptions);
+  void StopPrewarm();
+  void PrewarmScanThread();
+  void PrewarmCreationThread();
+  void AdoptPrewarmedShaders();
+  void ClaimPrewarmPipeline(Pipeline* pipeline);
+  void AwaitClaimedPrewarmPipelines();
+  void ReportPipelineUse();
+  // Scan thread input, fixed while it runs: indexed shaders not yet loaded,
+  // sorted by prefix hash, a bit filter of the prefix hashes and the
+  // modifications the pending descriptions need per shader.
+  std::vector<pipeline_storage_seed::ShaderIndexEntry> prewarm_index_;
+  std::vector<uint64_t> prewarm_prefix_filter_;
+  std::unordered_map<uint64_t, std::vector<uint64_t>> prewarm_modifications_;
+  // Indexed shaders the scan thread first rebuilds from the title's own
+  // ProgramCache (<title>.xshp + gpu_program_cache_source), before the game
+  // creates them: the whole list is ready at startup, even on a first start.
+  std::vector<pipeline_storage_seed::ShaderPatchEntry> prewarm_rebuild_;
+  std::vector<uint8_t> prewarm_program_cache_;
+  // Descriptions whose shaders were missing at the preload (processor thread).
+  std::vector<PipelineStoredDescription> prewarm_pending_;
+  std::mutex prewarm_lock_;
+  std::condition_variable prewarm_cond_;
+  bool prewarm_shutdown_ = false;  // prewarm_lock_
+  std::vector<D3D12Shader*> prewarm_ready_;       // prewarm_lock_: scan -> processor
+  std::deque<Pipeline*> prewarm_creation_queue_;  // prewarm_lock_
+  std::vector<Pipeline*> prewarm_claimed_creating_;  // processor thread, this submission
+  std::unique_ptr<rex::thread::Thread> prewarm_scan_thread_;
+  std::vector<std::unique_ptr<rex::thread::Thread>> prewarm_creation_threads_;
+  std::atomic<uint32_t> prewarm_shaders_found_{0};
+  std::atomic<uint32_t> prewarm_pipelines_queued_{0};
+  std::atomic<uint32_t> prewarm_pipelines_created_{0};
+  uint32_t prewarm_shaders_adopted_ = 0;   // processor thread
+  uint32_t prewarm_pipelines_claimed_ = 0;  // processor thread
+  // Pipelines created because a draw needed them (each a possible hitch on a
+  // cold driver cache), reported with the prewarm counters.
+  uint64_t draw_created_pipelines_ = 0;
+  // Submissions that waited at least 0.5 ms for pipeline creation, their
+  // total and longest wait, and how many waited 16 ms or more.
+  uint64_t creation_waits_ = 0;
+  uint64_t creation_wait_us_total_ = 0;
+  uint64_t creation_wait_us_max_ = 0;
+  uint64_t creation_waits_over_16ms_ = 0;
+  uint64_t reported_draw_created_pipelines_ = 0;  // signature of the last report
+  uint64_t reported_pipeline_use_tick_ = 0;
 };
 
 }  // namespace rex::graphics::d3d12

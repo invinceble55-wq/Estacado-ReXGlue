@@ -14,6 +14,8 @@
 #include <filesystem>
 #include <string>
 #include <atomic>
+#include <chrono>
+#include <future>
 #include <cfloat>
 #include <cstddef>
 #include <cstdio>
@@ -39,6 +41,8 @@
 #include <rex/math.h>
 #include <rex/ui/d3d12/d3d12_upload_buffer_pool.h>
 #include <rex/ui/d3d12/d3d12_util.h>
+
+REXCVAR_DECLARE(std::string, gpu_prompt_icon_source);
 
 REXCVAR_DEFINE_BOOL(graphics_hd_textures, false, "Graphics",
                     "Show installed HD texture packs (texture_packs folder next to the game) "
@@ -806,6 +810,7 @@ void D3D12TextureCache::BeginSubmission(uint64_t new_submission_index) {
 
 void D3D12TextureCache::BeginFrame() {
   TextureCache::BeginFrame();
+  UpdatePromptIcons();
   if (!pack_index_built_ && TextureReplacementEnabled()) {
     EnsurePackIndex();
   }
@@ -3532,6 +3537,17 @@ bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, 
 
   command_processor_.ReleaseScratchGPUBuffer(copy_buffer, copy_buffer_state);
 
+  // Keyboard button prompts: the title's controller icons are recognised
+  // when their base level loads (small 2D BC3 textures of the icons' sizes).
+  if (load_base && !texture_key.scaled_resolve && texture_key.format == xenos::TextureFormat::k_DXT4_5 &&
+      texture_key.dimension == xenos::DataDimension::k2DOrStacked &&
+      texture_key.GetDepthOrArraySize() == 1) {
+    EnsurePromptIconSet();
+    if (prompt_icon_set_.IsCandidateSize(texture_key.GetWidth(), texture_key.GetHeight())) {
+      NotePromptIconCandidate(d3d12_texture);
+    }
+  }
+
   // A full load (base and every mip): HD texture pack dump and replacement.
   const bool texture_dump = REXCVAR_GET(gpu_texture_dump);
   const bool texture_replace = TextureReplacementEnabled();
@@ -4241,6 +4257,7 @@ void D3D12TextureCache::UpdatePackReplacements() {
 }
 
 void D3D12TextureCache::OnD3D12TextureDestroyed(D3D12Texture& texture) {
+  prompt_icon_textures_.erase(&texture);
   for (size_t i = 0; i < textures_awaiting_replacement_.size();) {
     if (textures_awaiting_replacement_[i].first == &texture) {
       textures_awaiting_replacement_[i] = textures_awaiting_replacement_.back();
@@ -4796,6 +4813,221 @@ xenos::ClampMode D3D12TextureCache::NormalizeClampMode(xenos::ClampMode clamp_mo
     return xenos::ClampMode::kMirrorClampToEdge;
   }
   return clamp_mode;
+}
+
+
+void D3D12TextureCache::EnsurePromptIconSet() {
+  if (prompt_icon_set_loaded_) {
+    return;
+  }
+  prompt_icon_set_loaded_ = true;
+  const std::string& source = REXCVAR_GET(gpu_prompt_icon_source);
+  if (source.empty()) {
+    return;
+  }
+  std::string error;
+  const bool loaded = prompt_icon_set_.Load(std::filesystem::u8path(source), error);
+  std::fprintf(stderr, "REX_PROMPT_ICONS loaded=%u icons=%zu%s%s\n", loaded ? 1u : 0u,
+               prompt_icon_set_.icons().size(), loaded ? "" : " error=",
+               loaded ? "" : error.c_str());
+  std::fflush(stderr);
+}
+
+uint64_t D3D12TextureCache::ComputePromptIconSignature(const D3D12Texture& texture) const {
+  const TextureKey key = texture.key();
+  const texture_util::TextureGuestLayout::Level& level = texture.guest_layout().base;
+  const uint32_t base_size = texture.GetGuestBaseSize();
+  const uint8_t* base = shared_memory().GuestPhysicalForRead(key.base_page << 12, base_size);
+  if (!base || level.row_pitch_bytes < 16) {
+    return 0;
+  }
+  // BC3: 16-byte blocks of 4x4 texels; the base level untiled into rows and
+  // swapped to host byte order like the texture load shaders do.
+  const uint32_t blocks_x = (key.GetWidth() + 3) >> 2;
+  const uint32_t blocks_y = (key.GetHeight() + 3) >> 2;
+  std::vector<uint8_t> blocks(size_t(blocks_x) * blocks_y * 16);
+  for (uint32_t by = 0; by < blocks_y; ++by) {
+    for (uint32_t bx = 0; bx < blocks_x; ++bx) {
+      const int64_t offset =
+          key.tiled ? int64_t(texture_util::GetTiledOffset2D(int32_t(bx), int32_t(by),
+                                                             level.row_pitch_bytes >> 4, 4))
+                    : int64_t(by) * level.row_pitch_bytes + int64_t(bx) * 16;
+      if (offset < 0 || uint64_t(offset) + 16 > base_size) {
+        return 0;
+      }
+      uint8_t* out = &blocks[(size_t(by) * blocks_x + bx) * 16];
+      std::memcpy(out, base + offset, 16);
+      switch (key.endianness) {
+        case xenos::Endian::k8in16:
+          for (size_t i = 0; i < 16; i += 2) std::swap(out[i], out[i + 1]);
+          break;
+        case xenos::Endian::k8in32:
+          for (size_t i = 0; i < 16; i += 4) {
+            std::swap(out[i], out[i + 3]);
+            std::swap(out[i + 1], out[i + 2]);
+          }
+          break;
+        case xenos::Endian::k16in32:
+          for (size_t i = 0; i < 16; i += 4) {
+            std::swap(out[i], out[i + 2]);
+            std::swap(out[i + 1], out[i + 3]);
+          }
+          break;
+        default:
+          break;
+      }
+    }
+  }
+  return prompt_icons::BlockSignature(blocks.data(), blocks.size());
+}
+
+void D3D12TextureCache::NotePromptIconCandidate(D3D12Texture& texture) {
+  const TextureKey key = texture.key();
+  const uint64_t signature = ComputePromptIconSignature(texture);
+  const int32_t icon =
+      signature ? prompt_icon_set_.Find(key.GetWidth(), key.GetHeight(), signature) : -1;
+  if (icon < 0) {
+    prompt_icon_textures_.erase(&texture);
+    return;
+  }
+  PromptIconTexture& entry = prompt_icon_textures_[&texture];
+  entry.icon = icon;
+  // The id a shown keycap carries: a reload keeps it while the guest data is
+  // unchanged (LoadTextureDataFromResidentMemoryImpl).
+  entry.content_id = ComputeTextureContentId(texture);
+  static uint32_t logged = 0;
+  if (logged < 64) {
+    ++logged;
+    std::fprintf(stderr, "REX_PROMPT_ICON name=%s base=0x%08X size=%ux%u tiled=%u endian=%u\n",
+                 prompt_icon_set_.icons()[size_t(icon)].name.c_str(), key.base_page << 12,
+                 key.GetWidth(), key.GetHeight(), uint32_t(key.tiled), uint32_t(key.endianness));
+    std::fflush(stderr);
+  }
+}
+
+void D3D12TextureCache::UpdatePromptIcons() {
+  if (prompt_icon_set_.empty()) {
+    return;
+  }
+  // Keycaps are drawn and their textures created on a worker as soon as the
+  // icons are known, and again when the bindings change (labels generation),
+  // so the first keyboard input only switches views.
+  const uint32_t generation = prompt_icons::LabelsGeneration();
+  if (!prompt_keycap_build_.valid() && generation != prompt_keycaps_generation_ &&
+      generation != prompt_keycap_failed_generation_) {
+    const ui::d3d12::D3D12Provider& provider = command_processor_.GetD3D12Provider();
+    ID3D12Device* device = provider.GetDevice();
+    const D3D12_HEAP_FLAGS heap_flags = provider.GetHeapFlagCreateNotZeroed();
+    std::vector<prompt_icons::Icon> icons = prompt_icon_set_.icons();
+    std::vector<prompt_icons::ButtonLabel> labels = prompt_icons::CurrentLabels();
+    prompt_keycap_build_generation_ = generation;
+    prompt_keycap_build_ = std::async(
+        std::launch::async,
+        [device, heap_flags, icons = std::move(icons), labels = std::move(labels)]() {
+          std::vector<std::shared_ptr<PreparedPackUpload>> prepared;
+          for (const prompt_icons::Icon& icon : icons) {
+            const texture_pack::DdsImage image = prompt_icons::RenderKeycap(icon, labels);
+            auto upload = std::static_pointer_cast<PreparedPackUpload>(
+                PreparePackUpload(device, heap_flags, image));
+            if (!upload) {
+              return std::vector<std::shared_ptr<PreparedPackUpload>>();
+            }
+            prepared.push_back(std::move(upload));
+          }
+          return prepared;
+        });
+  }
+  bool views_changed = false;
+  if (prompt_keycap_build_.valid() &&
+      prompt_keycap_build_.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+    std::vector<std::shared_ptr<PreparedPackUpload>> prepared = prompt_keycap_build_.get();
+    if (prepared.size() != prompt_icon_set_.icons().size()) {
+      prompt_keycap_failed_generation_ = prompt_keycap_build_generation_;
+      std::fprintf(stderr, "REX_PROMPT_KEYCAPS built=0 generation=%08X\n",
+                   prompt_keycap_build_generation_);
+      std::fflush(stderr);
+    } else {
+      DeferredCommandList& command_list = command_processor_.GetDeferredCommandList();
+      std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>> keycaps;
+      for (const std::shared_ptr<PreparedPackUpload>& upload : prepared) {
+        for (UINT level = 0; level < UINT(upload->footprints.size()); ++level) {
+          D3D12_TEXTURE_COPY_LOCATION dest = {};
+          dest.pResource = upload->texture.Get();
+          dest.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+          dest.SubresourceIndex = level;
+          D3D12_TEXTURE_COPY_LOCATION source = {};
+          source.pResource = upload->upload.Get();
+          source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+          source.PlacedFootprint = upload->footprints[level];
+          command_list.D3DCopyTextureRegion(&dest, 0, 0, 0, &source, nullptr);
+        }
+        command_processor_.PushTransitionBarrier(
+            upload->texture.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        DeferredTextureRelease release;
+        release.submission = command_processor_.GetCurrentSubmission();
+        release.resource = std::move(upload->upload);
+        deferred_texture_releases_.push_back(std::move(release));
+        keycaps.push_back(std::move(upload->texture));
+      }
+      command_processor_.SubmitBarriers();
+      // Textures showing the previous keycaps take the new ones below.
+      for (auto& [texture, entry] : prompt_icon_textures_) {
+        if (entry.keycap && texture->replaced()) {
+          DeferredTextureRelease release;
+          release.submission = command_processor_.GetCurrentSubmission();
+          release.resource = texture->RestoreOriginal();
+          texture->TakeSRVDescriptors(release.descriptors);
+          deferred_texture_releases_.push_back(std::move(release));
+          views_changed = true;
+        }
+        entry.keycap = false;
+      }
+      prompt_keycaps_ = std::move(keycaps);
+      prompt_keycaps_generation_ = prompt_keycap_build_generation_;
+      std::fprintf(stderr, "REX_PROMPT_KEYCAPS built=%zu generation=%08X\n", prompt_keycaps_.size(),
+                   prompt_keycaps_generation_);
+      std::fflush(stderr);
+    }
+  }
+  const bool keyboard = !prompt_keycaps_.empty() && prompt_icons::KeyboardPromptsWanted();
+  uint32_t switched = 0;
+  for (auto& [texture, entry] : prompt_icon_textures_) {
+    if (entry.keycap && !texture->replaced()) {
+      // Reverted by a reload (its guest data changed).
+      entry.keycap = false;
+    }
+    const bool want = keyboard && size_t(entry.icon) < prompt_keycaps_.size();
+    if (want && !entry.keycap && !texture->replaced()) {
+      DeferredTextureRelease release;
+      release.submission = command_processor_.GetCurrentSubmission();
+      texture->TakeSRVDescriptors(release.descriptors);
+      deferred_texture_releases_.push_back(std::move(release));
+      texture->ShowReplacement(entry.content_id, prompt_keycaps_[size_t(entry.icon)],
+                               D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
+                                   D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+      entry.keycap = true;
+      ++switched;
+    } else if (!want && entry.keycap) {
+      DeferredTextureRelease release;
+      release.submission = command_processor_.GetCurrentSubmission();
+      release.resource = texture->RestoreOriginal();
+      texture->TakeSRVDescriptors(release.descriptors);
+      deferred_texture_releases_.push_back(std::move(release));
+      entry.keycap = false;
+      ++switched;
+    }
+  }
+  if (switched || views_changed) {
+    replacement_bindings_dirty_ = true;
+  }
+  if (keyboard != prompt_keyboard_shown_ || switched) {
+    std::fprintf(stderr, "REX_PROMPT_MODE keyboard=%u icons=%zu switched=%u\n", keyboard ? 1u : 0u,
+                 prompt_icon_textures_.size(), switched);
+    std::fflush(stderr);
+  }
+  prompt_keyboard_shown_ = keyboard;
 }
 
 }  // namespace rex::graphics::d3d12

@@ -25,6 +25,7 @@
 #include <string>
 #include <system_error>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include <rex/hash.h>
@@ -239,6 +240,178 @@ inline FileResult MergePipelines(const std::filesystem::path& seed_path,
         return ParsePipelines(data, api, version, records);
       },
       false);
+}
+
+// Shader index (<title>.xshi): which guest shaders the pipeline descriptions
+// need, without their microcode, so a package can carry it. Per shader: the
+// microcode hash (the storage key), its dword count and type, and the XXH3 of
+// its first kIndexPrefixBytes bytes, which lets the pipeline cache recognise
+// the shader in guest memory as soon as the game has created it, before its
+// first draw (PipelineCache prewarm). Little-endian, like the other stores.
+inline constexpr uint32_t kShaderIndexMagic = 0x49534558;  // 'XESI'
+inline constexpr size_t kShaderIndexRecordSize = 24;
+inline constexpr size_t kIndexPrefixBytes = 32;
+
+struct ShaderIndexEntry {
+  uint64_t ucode_hash = 0;
+  uint32_t dword_count = 0;
+  uint32_t type = 0;  // xenos::ShaderType: 0 vertex, 1 pixel
+  uint64_t prefix_hash = 0;
+};
+
+inline uint64_t ShaderIndexPrefixHash(const void* ucode, size_t ucode_bytes) {
+  return XXH3_64bits(ucode, ucode_bytes < kIndexPrefixBytes ? ucode_bytes : kIndexPrefixBytes);
+}
+
+// The index of every shader in a shader store (.xsh) with at least
+// kIndexPrefixBytes of microcode (shorter ones are too ambiguous to find).
+inline std::vector<uint8_t> BuildShaderIndex(const std::vector<uint8_t>& shader_store,
+                                             uint32_t shader_version) {
+  std::vector<Record> records;
+  if (!ParseShaders(shader_store, shader_version, records)) return {};
+  std::vector<uint8_t> out;
+  AppendU32(out, kShaderIndexMagic);
+  AppendU32(out, ByteSwap32(shader_version));
+  for (const Record& record : records) {
+    uint32_t bits;
+    std::memcpy(&bits, shader_store.data() + record.offset + 8, sizeof(bits));
+    const size_t ucode_bytes = size_t(bits & 0x7FFFFFFFu) * sizeof(uint32_t);
+    if (ucode_bytes < kIndexPrefixBytes) continue;
+    const uint8_t* ucode = shader_store.data() + record.offset + kShaderRecordHeaderSize;
+    const uint64_t prefix = ShaderIndexPrefixHash(ucode, ucode_bytes);
+    const size_t at = out.size();
+    out.resize(at + kShaderIndexRecordSize);
+    std::memcpy(out.data() + at, &record.hash, 8);
+    const uint32_t count = bits & 0x7FFFFFFFu;
+    const uint32_t type = bits >> 31;
+    std::memcpy(out.data() + at + 8, &count, 4);
+    std::memcpy(out.data() + at + 12, &type, 4);
+    std::memcpy(out.data() + at + 16, &prefix, 8);
+  }
+  return out;
+}
+
+inline bool ParseShaderIndex(const std::vector<uint8_t>& data, uint32_t shader_version,
+                             std::vector<ShaderIndexEntry>& entries) {
+  entries.clear();
+  if (data.size() < 8) return false;
+  uint32_t magic, version;
+  std::memcpy(&magic, data.data(), 4);
+  std::memcpy(&version, data.data() + 4, 4);
+  if (magic != kShaderIndexMagic || ByteSwap32(version) != shader_version) return false;
+  for (size_t at = 8; at + kShaderIndexRecordSize <= data.size(); at += kShaderIndexRecordSize) {
+    ShaderIndexEntry entry;
+    std::memcpy(&entry.ucode_hash, data.data() + at, 8);
+    std::memcpy(&entry.dword_count, data.data() + at + 8, 4);
+    std::memcpy(&entry.type, data.data() + at + 12, 4);
+    std::memcpy(&entry.prefix_hash, data.data() + at + 16, 8);
+    if (entry.dword_count * sizeof(uint32_t) < kIndexPrefixBytes || entry.type > 1 ||
+        entry.dword_count > 0xFFFFu) {
+      continue;
+    }
+    entries.push_back(entry);
+  }
+  return true;
+}
+
+// Shader rebuild list (<title>.xshp, scripts/program-cache-patches.py): the
+// title keeps its compiled shaders in System/Xenon/ProgramCache.xpc, and the
+// console's Direct3D patches the vertex-fetch instructions of each vertex
+// shader for the vertex layout it is bound with. Per shader the game draws
+// with: the microcode hash of its ProgramCache source and the changed dwords
+// as XOR masks (vertex-fetch formats, strides, offsets and slots), so the
+// player's own ProgramCache rebuilds it before its first use. Carries no
+// microcode; a rebuilt shader is used only if its hash matches.
+// Little-endian: 'XESP', shader version (byte-swapped), entry count, then per
+// entry: runtime hash u64, source hash u64, dword count u32, type u32, patch
+// count u32 and that many (dword index u32, xor u32).
+inline constexpr uint32_t kShaderPatchMagic = 0x50534558;  // 'XESP'
+
+struct ShaderPatchEntry {
+  uint64_t runtime_hash = 0;
+  uint64_t source_hash = 0;
+  uint32_t dword_count = 0;
+  uint32_t type = 0;  // xenos::ShaderType: 0 vertex, 1 pixel
+  std::vector<std::pair<uint32_t, uint32_t>> patches;  // dword index, xor
+};
+
+inline bool ParseShaderPatches(const std::vector<uint8_t>& data, uint32_t shader_version,
+                               std::vector<ShaderPatchEntry>& entries) {
+  entries.clear();
+  if (data.size() < 12) return false;
+  uint32_t magic, version, count;
+  std::memcpy(&magic, data.data(), 4);
+  std::memcpy(&version, data.data() + 4, 4);
+  std::memcpy(&count, data.data() + 8, 4);
+  if (magic != kShaderPatchMagic || ByteSwap32(version) != shader_version) return false;
+  size_t at = 12;
+  for (uint32_t i = 0; i < count; ++i) {
+    if (data.size() - at < 28) return false;
+    ShaderPatchEntry entry;
+    uint32_t patch_count;
+    std::memcpy(&entry.runtime_hash, data.data() + at, 8);
+    std::memcpy(&entry.source_hash, data.data() + at + 8, 8);
+    std::memcpy(&entry.dword_count, data.data() + at + 16, 4);
+    std::memcpy(&entry.type, data.data() + at + 20, 4);
+    std::memcpy(&patch_count, data.data() + at + 24, 4);
+    at += 28;
+    if (entry.type > 1 || !entry.dword_count || entry.dword_count > 0xFFFFu ||
+        patch_count > entry.dword_count || (data.size() - at) / 8 < patch_count) {
+      return false;
+    }
+    entry.patches.resize(patch_count);
+    for (auto& patch : entry.patches) {
+      std::memcpy(&patch.first, data.data() + at, 4);
+      std::memcpy(&patch.second, data.data() + at + 4, 4);
+      at += 8;
+      if (patch.first >= entry.dword_count) return false;
+    }
+    entries.push_back(std::move(entry));
+  }
+  return at == data.size();
+}
+
+// The shader containers of a title's ProgramCache.xpc: big-endian headers
+// with flags 0x102A11xx (bit 0 = vertex), virtual and physical sizes, and the
+// microcode at virtual size + its physical offset (as in
+// tools/xenos_shader_catalog.cpp). Returns microcode spans within data.
+struct ProgramCacheShader {
+  size_t offset = 0;  // of the microcode in data
+  uint32_t bytes = 0;
+  uint32_t type = 0;  // 0 vertex, 1 pixel
+};
+
+inline uint32_t ReadBigEndian32(const std::vector<uint8_t>& data, size_t at) {
+  return (uint32_t(data[at]) << 24) | (uint32_t(data[at + 1]) << 16) |
+         (uint32_t(data[at + 2]) << 8) | uint32_t(data[at + 3]);
+}
+
+inline std::vector<ProgramCacheShader> ParseProgramCache(const std::vector<uint8_t>& data) {
+  std::vector<ProgramCacheShader> shaders;
+  for (size_t offset = 0; offset + 36 <= data.size(); ++offset) {
+    const uint32_t flags = ReadBigEndian32(data, offset);
+    if ((flags & 0xFFFFFF00u) != 0x102A1100u) continue;
+    const uint32_t virtual_size = ReadBigEndian32(data, offset + 4);
+    const uint32_t physical_size = ReadBigEndian32(data, offset + 8);
+    const uint32_t constant_table_offset = ReadBigEndian32(data, offset + 16);
+    const uint32_t shader_offset = ReadBigEndian32(data, offset + 24);
+    const uint64_t container_size = uint64_t(virtual_size) + physical_size;
+    if (container_size < 36 || container_size > data.size() - offset ||
+        ReadBigEndian32(data, offset + 28) || ReadBigEndian32(data, offset + 32) ||
+        !constant_table_offset || constant_table_offset >= virtual_size || !shader_offset ||
+        uint64_t(shader_offset) + 24 > virtual_size) {
+      continue;
+    }
+    const uint32_t ucode_physical_offset = ReadBigEndian32(data, offset + shader_offset);
+    const uint32_t ucode_bytes = ReadBigEndian32(data, offset + shader_offset + 4);
+    const uint64_t ucode_relative = uint64_t(virtual_size) + ucode_physical_offset;
+    if ((ucode_bytes & 3u) || !ucode_bytes || ucode_relative > container_size ||
+        ucode_bytes > container_size - ucode_relative) {
+      continue;
+    }
+    shaders.push_back({offset + size_t(ucode_relative), ucode_bytes, (flags & 1u) ? 0u : 1u});
+  }
+  return shaders;
 }
 
 }  // namespace rex::graphics::d3d12::pipeline_storage_seed

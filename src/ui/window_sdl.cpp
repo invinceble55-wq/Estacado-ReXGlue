@@ -402,6 +402,13 @@ void WindowSDL::RequestPaintImpl() {
   SDL_PushEvent(&event);
 }
 
+void WindowSDL::PostCloseRequest() {
+  SDL_Event event{};
+  event.type = SDL_EVENT_WINDOW_CLOSE_REQUESTED;
+  event.window.windowID = sdl_window_id_;
+  SDL_PushEvent(&event);
+}
+
 void WindowSDL::HandlePaintEvent() {
   paint_pending_.store(false, std::memory_order_release);
   OnPaint();

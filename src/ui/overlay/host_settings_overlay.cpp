@@ -59,13 +59,15 @@ ImGuiDrawer::FontSetupCallback HostSettingsFontSetup(ImFont** font) {
 HostSettingsOverlayDialog::HostSettingsOverlayDialog(ImGuiDrawer* imgui_drawer,
                                                      HostSettingsState& state, ImFont* font,
                                                      std::string toggle_key_name,
-                                                     LiveCallback live, CloseCallback close)
+                                                     LiveCallback live, CloseCallback close,
+                                                     QuitCallback quit)
     : ImGuiDialog(imgui_drawer),
       state_(state),
       font_(font),
       toggle_key_name_(std::move(toggle_key_name)),
       live_(std::move(live)),
-      close_(std::move(close)) {}
+      close_(std::move(close)),
+      quit_(std::move(quit)) {}
 
 HostSettingsOverlayDialog::~HostSettingsOverlayDialog() = default;
 
@@ -205,9 +207,40 @@ void HostSettingsOverlayDialog::OnDraw(ImGuiIO& io) {
     if (ImGui::Button(resume.c_str(), ImVec2(button, 0.0f))) Close();
     ImGui::PopStyleColor(2);
   };
+  // Quit game: asks first (progress since the last checkpoint is lost).
+  bool quit_requested = false;
+  const std::string quit = shown(tr("Quit game")) + "##quit";
+  auto quit_button = [&]() {
+    if (!quit_) return;
+    if (ImGui::Button(quit.c_str(), ImVec2(button, 0.0f))) {
+      ImGui::OpenPopup("##quitconfirm");
+    }
+    if (ImGui::BeginPopupModal("##quitconfirm", nullptr,
+                               ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_AlwaysAutoResize)) {
+      ImGui::TextUnformatted(shown(tr("Quit the game? Progress since the last checkpoint or "
+                                      "save is lost."))
+                                 .c_str());
+      ImGui::Spacing();
+      if (ImGui::Button((shown(tr("Quit game")) + "##quityes").c_str(), ImVec2(button, 0.0f))) {
+        quit_requested = true;
+        ImGui::CloseCurrentPopup();
+      }
+      ImGui::SameLine();
+      if (ImGui::Button((shown(tr("Cancel")) + "##quitno").c_str(), ImVec2(button, 0.0f)) ||
+          ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
+        ImGui::CloseCurrentPopup();
+      }
+      ImGui::EndPopup();
+    }
+  };
+  const float buttons = quit_ ? button * 2.0f + ImGui::GetStyle().ItemSpacing.x : button;
   if (rtl) {
     // Mirrored: Resume on the left, the note right-aligned.
     resume_button();
+    if (quit_) {
+      ImGui::SameLine();
+      quit_button();
+    }
     ImGui::SameLine();
     const std::string note = shown(footer_text);
     const float available = ImGui::GetContentRegionAvail().x;
@@ -216,11 +249,21 @@ void HostSettingsOverlayDialog::OnDraw(ImGuiIO& io) {
     ImGui::TextDisabled("%s", note.c_str());
   } else {
     ImGui::TextDisabled("%s", footer_text.c_str());
-    ImGui::SameLine(ImGui::GetContentRegionMax().x - button);
+    ImGui::SameLine(ImGui::GetContentRegionMax().x - buttons);
+    if (quit_) {
+      quit_button();
+      ImGui::SameLine();
+    }
     resume_button();
   }
   ImGui::End();
   if (font_) ImGui::PopFont();
+  if (quit_requested) {
+    // The owner queues the window's close request (the game stops as after
+    // Alt+F4); this dialog closes with it.
+    quit_();
+    Close();
+  }
 }
 
 void HostSettingsOverlayDialog::OnClose() {
