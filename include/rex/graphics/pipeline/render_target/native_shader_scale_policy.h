@@ -172,6 +172,19 @@ inline bool Matches(const Rule& rule, uint64_t vertex_hash, uint64_t pixel_hash,
                             : msaa_log2 == 0);
 }
 
+// The rules without their image filters (width 0 matches no texture), for
+// frames a title renders with 2x MSAA (#16: black 2x4-pixel holes and
+// flickering squares on some NVIDIA RTX 20/30 cards, only in those frames and
+// only with the image filters). Data rules are unchanged; every rule keeps its
+// index (per-rule logs).
+inline Rules WithoutImageFilters(const Rules& rules) {
+  Rules result = rules;
+  for (uint32_t i = 0; i < result.count; ++i) {
+    if (result.entries[i].image_filter) result.entries[i].width = 0;
+  }
+  return result;
+}
+
 inline bool RequiresNativeRasterization(const Rule& rule, uint32_t msaa_log2) {
   // Never expand rasterized lookup/data tables. The opt-in image filter alone
   // may keep a scaled output so a later ordinary sampler does not see repeated

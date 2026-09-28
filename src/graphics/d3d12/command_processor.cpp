@@ -61,6 +61,11 @@ REXCVAR_DEFINE_STRING(
     draw_resolution_scale_native_grid_rules, "", "GPU/D3D12",
     "Native-grid pass annotations: VS:PS:fetch:width:height:format[:filter], semicolon-separated")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(
+    draw_resolution_scale_native_grid_2x_msaa_filters, false, "GPU/D3D12",
+    "Keep the image-filter native-grid rules in frames the title renders with 2x MSAA (off: "
+    "they are left out there, issue #16)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 REXCVAR_DEFINE_BOOL(d3d12_readback_memexport, false, "GPU/D3D12",
                     "Read data written by memory export in shaders on the CPU")
@@ -3190,19 +3195,24 @@ bool D3D12CommandProcessor::SetupContext() {
                "REX_GPU_TEST_SWITCHES conservative_sync=%u async_submission=%u "
                "native_grid_rules=%u depth_pixel_center=%u uncompressed_render_targets=%u "
                "native_2x_msaa=%u transfer_stencil_clear_by_draw=%u "
-               "depth_transfer_not_equal=%u\n",
+               "depth_transfer_not_equal=%u native_grid_2x_msaa_filters=%u\n",
                REXCVAR_GET(d3d12_conservative_sync) ? 1u : 0u, async_submission_ ? 1u : 0u,
                REXCVAR_GET(draw_resolution_scale_native_grid_rules).empty() ? 0u : 1u,
                REXCVAR_GET(resolve_depth_pixel_center) ? 1u : 0u,
                REXCVAR_GET(d3d12_render_target_uncompressed) ? 1u : 0u,
                REXCVAR_GET(native_2x_msaa) ? 1u : 0u,
                REXCVAR_GET(d3d12_transfer_stencil_clear_by_draw) ? 1u : 0u,
-               REXCVAR_GET(depth_transfer_not_equal_test) ? 1u : 0u);
+               REXCVAR_GET(depth_transfer_not_equal_test) ? 1u : 0u,
+               REXCVAR_GET(draw_resolution_scale_native_grid_2x_msaa_filters) ? 1u : 0u);
   if (!render_target::native_shader_scale_policy::Parse(
-          REXCVAR_GET(draw_resolution_scale_native_grid_rules), native_shader_grid_rules_)) {
+          REXCVAR_GET(draw_resolution_scale_native_grid_rules),
+          native_shader_grid_rules_configured_)) {
     REXGPU_ERROR("Invalid native shader-grid policy; refusing ambiguous scale annotations");
     return false;
   }
+  native_shader_grid_rules_ = native_shader_grid_rules_configured_;
+  native_grid_frame_resolved_2x_msaa_ = false;
+  native_grid_filters_suspended_ = false;
   native_shader_grid_logged_mask_ = 0;
   embedded_target_writer_config_ = {
       REXCVAR_GET(embedded_target_writer_surface),
@@ -4621,9 +4631,30 @@ bool D3D12CommandProcessor::EnsureSmaaResources(uint32_t width, uint32_t height)
   return true;
 }
 
+void D3D12CommandProcessor::UpdateNativeGridFiltersAtSwap() {
+  const bool suspend = native_grid_frame_resolved_2x_msaa_ &&
+                       !REXCVAR_GET(draw_resolution_scale_native_grid_2x_msaa_filters);
+  native_grid_frame_resolved_2x_msaa_ = false;
+  if (suspend == native_grid_filters_suspended_) return;
+  native_grid_filters_suspended_ = suspend;
+  native_shader_grid_rules_ =
+      suspend ? render_target::native_shader_scale_policy::WithoutImageFilters(
+                    native_shader_grid_rules_configured_)
+              : native_shader_grid_rules_configured_;
+  static uint32_t logged = 0;
+  if (logged < 64 || (logged & 1023) == 0) {
+    std::fprintf(stderr, "REX_NATIVE_GRID_FILTERS active=%u reason=%s changes=%u\n",
+                 suspend ? 0u : 1u, suspend ? "title_2x_msaa" : "title_4x_msaa", logged + 1);
+    std::fflush(stderr);
+  }
+  ++logged;
+}
+
 void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                       uint32_t frontbuffer_height) {
   SCOPE_profile_cpu_f("gpu");
+  // #16: the next frame's native-grid rules follow this frame's MSAA mode.
+  UpdateNativeGridFiltersAtSwap();
   // Frame tracking (no-ops unless low latency or NVIDIA Streamline uses it):
   // this swap's guest frame, ended after its final submission or on return.
   ui::frame_latency::BeginRenderSubmit();
@@ -9456,6 +9487,10 @@ bool D3D12CommandProcessor::IssueCopy() {
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
   if (!BeginSubmission(true)) {
     return false;
+  }
+  // #16: a resolve from a 2x-MSAA surface marks the title's 2x-MSAA frames.
+  if (register_file_->Get<reg::RB_SURFACE_INFO>().msaa_samples == xenos::MsaaSamples::k2X) {
+    native_grid_frame_resolved_2x_msaa_ = true;
   }
   if (embedded_frame_dump_file) EmbeddedFrameDumpCopy(*register_file_);
   if (temporal_aa_enabled_) TemporalAaCopy();

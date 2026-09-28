@@ -675,6 +675,15 @@ class D3D12CommandProcessor : public CommandProcessor {
   std::unique_ptr<D3D12RenderTargetCache> render_target_cache_;
   render_target::native_shader_scale_policy::Rules native_shader_grid_rules_;
   uint64_t native_shader_grid_logged_mask_ = 0;  // two bits per rule (MSAA class)
+  // #16: while the title renders with 2x MSAA (a resolve from a 2x surface in
+  // the previous frame), native_shader_grid_rules_ holds the configured rules
+  // without their image filters (WithoutImageFilters), unless
+  // draw_resolution_scale_native_grid_2x_msaa_filters. Switched at IssueSwap;
+  // IssueDraw only reads native_shader_grid_rules_.
+  render_target::native_shader_scale_policy::Rules native_shader_grid_rules_configured_;
+  bool native_grid_frame_resolved_2x_msaa_ = false;
+  bool native_grid_filters_suspended_ = false;
+  void UpdateNativeGridFiltersAtSwap();
   // Footprint reconstruction per fetch for the current draw's matched image
   // filter rules. A filter variant compiles the reconstruction for every 2D
   // fetch; each one's region constant selects at runtime: kOff samples
