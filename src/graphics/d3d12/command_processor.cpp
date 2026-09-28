@@ -20,7 +20,9 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <sstream>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -1144,6 +1146,121 @@ bool GetEmbeddedGameplayCaptureRequest(uint64_t& generation) noexcept {
   generation = embedded_manual_capture_request_generation.load(
       std::memory_order_acquire);
   return true;
+}
+
+// Play-testing snapshot (#14): see embedded_diagnostics.h. The request comes
+// from the UI thread; the file is opened, written and closed on the command
+// processor thread only (at guest swaps, draws and resolves).
+std::mutex embedded_frame_dump_request_mutex;
+std::string embedded_frame_dump_request_path;  // embedded_frame_dump_request_mutex
+std::atomic<bool> embedded_frame_dump_requested{false};
+std::FILE* embedded_frame_dump_file = nullptr;  // command processor thread
+std::string embedded_frame_dump_path;           // command processor thread
+uint32_t embedded_frame_dump_draws = 0;
+uint32_t embedded_frame_dump_copies = 0;
+
+void RequestEmbeddedFrameDump(const char* path) noexcept {
+  if (!path || !*path) return;
+  try {
+    std::lock_guard<std::mutex> lock(embedded_frame_dump_request_mutex);
+    embedded_frame_dump_request_path = path;
+  } catch (...) {
+    return;
+  }
+  embedded_frame_dump_requested.store(true, std::memory_order_release);
+}
+
+// At each guest swap: finishes a frame being written, then starts a requested
+// one (the frame after this swap).
+void EmbeddedFrameDumpAtSwap(uint64_t frame, uint32_t scale_x, uint32_t scale_y) {
+  if (embedded_frame_dump_file) {
+    std::fprintf(embedded_frame_dump_file, "END frame=%llu draws=%u copies=%u\n",
+                 static_cast<unsigned long long>(frame), embedded_frame_dump_draws,
+                 embedded_frame_dump_copies);
+    std::fclose(embedded_frame_dump_file);
+    embedded_frame_dump_file = nullptr;
+    std::fprintf(stderr, "REX_DIAG_FRAME_DUMP written=%s draws=%u copies=%u frame=%llu\n",
+                 embedded_frame_dump_path.c_str(), embedded_frame_dump_draws,
+                 embedded_frame_dump_copies, static_cast<unsigned long long>(frame));
+    std::fflush(stderr);
+  }
+  if (!embedded_frame_dump_requested.exchange(false, std::memory_order_acq_rel)) return;
+  {
+    std::lock_guard<std::mutex> lock(embedded_frame_dump_request_mutex);
+    embedded_frame_dump_path = embedded_frame_dump_request_path;
+  }
+#if defined(_WIN32)
+  const std::filesystem::path path = std::filesystem::u8path(embedded_frame_dump_path);
+  embedded_frame_dump_file = _wfopen(path.c_str(), L"w");
+#else
+  embedded_frame_dump_file = std::fopen(embedded_frame_dump_path.c_str(), "w");
+#endif
+  embedded_frame_dump_draws = 0;
+  embedded_frame_dump_copies = 0;
+  if (!embedded_frame_dump_file) {
+    std::fprintf(stderr, "REX_DIAG_FRAME_DUMP failed=%s\n", embedded_frame_dump_path.c_str());
+    std::fflush(stderr);
+    return;
+  }
+  std::fprintf(embedded_frame_dump_file,
+               "FRAME_DUMP version=1 after_frame=%llu draw_scale=%ux%u\n"
+               "# D <draw> bins=select/mask vs ps prim verts surf c0..c3 depth mask colorctl "
+               "blend0..3 depthctl stencil stencil_bf modectl sumode woffset scissor_tl "
+               "scissor_br t<fetch>=6 dwords\n"
+               "# P = a packet the predicated-tiling bin check skipped\n"
+               "# C <copy> copyctl dest_base dest_pitch dest_info surf c0 depth woffset\n",
+               static_cast<unsigned long long>(frame), scale_x, scale_y);
+}
+
+void EmbeddedFrameDumpDraw(const RegisterFile& regs, const DxbcShader& vertex_shader,
+                           const DxbcShader* pixel_shader, uint32_t primitive_type,
+                           uint32_t vertices, uint64_t bin_select, uint64_t bin_mask) {
+  std::FILE* file = embedded_frame_dump_file;
+  std::fprintf(
+      file,
+      "D %u bins=%llX/%llX vs=%016llX ps=%016llX prim=%u verts=%u surf=%08X "
+      "c=%08X,%08X,%08X,%08X "
+      "depth=%08X mask=%08X colorctl=%08X blend=%08X,%08X,%08X,%08X depthctl=%08X "
+      "stencil=%08X,%08X modectl=%08X sumode=%08X woff=%08X sc=%08X,%08X",
+      embedded_frame_dump_draws++, static_cast<unsigned long long>(bin_select),
+      static_cast<unsigned long long>(bin_mask),
+      static_cast<unsigned long long>(vertex_shader.ucode_data_hash()),
+      static_cast<unsigned long long>(pixel_shader ? pixel_shader->ucode_data_hash() : 0),
+      primitive_type, vertices, regs[XE_GPU_REG_RB_SURFACE_INFO], regs[XE_GPU_REG_RB_COLOR_INFO],
+      regs[XE_GPU_REG_RB_COLOR1_INFO], regs[XE_GPU_REG_RB_COLOR2_INFO],
+      regs[XE_GPU_REG_RB_COLOR3_INFO], regs[XE_GPU_REG_RB_DEPTH_INFO],
+      regs[XE_GPU_REG_RB_COLOR_MASK], regs[XE_GPU_REG_RB_COLORCONTROL],
+      regs[XE_GPU_REG_RB_BLENDCONTROL0], regs[XE_GPU_REG_RB_BLENDCONTROL1],
+      regs[XE_GPU_REG_RB_BLENDCONTROL2], regs[XE_GPU_REG_RB_BLENDCONTROL3],
+      regs[XE_GPU_REG_RB_DEPTHCONTROL], regs[XE_GPU_REG_RB_STENCILREFMASK],
+      regs[XE_GPU_REG_RB_STENCILREFMASK_BF], regs[XE_GPU_REG_RB_MODECONTROL],
+      regs[XE_GPU_REG_PA_SU_SC_MODE_CNTL], regs[XE_GPU_REG_PA_SC_WINDOW_OFFSET],
+      regs[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_TL], regs[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_BR]);
+  uint32_t seen = 0;
+  auto bindings = [&](const DxbcShader& shader) {
+    for (const auto& binding : shader.GetTextureBindingsAfterTranslation()) {
+      const uint32_t index = binding.fetch_constant;
+      if (index >= 32 || (seen & (1u << index))) continue;
+      seen |= 1u << index;
+      const xenos::xe_gpu_texture_fetch_t fetch = regs.GetTextureFetch(index);
+      std::fprintf(file, " t%u=%08X.%08X.%08X.%08X.%08X.%08X", index, fetch.dword_0,
+                   fetch.dword_1, fetch.dword_2, fetch.dword_3, fetch.dword_4, fetch.dword_5);
+    }
+  };
+  bindings(vertex_shader);
+  if (pixel_shader) bindings(*pixel_shader);
+  std::fputc('\n', file);
+}
+
+void EmbeddedFrameDumpCopy(const RegisterFile& regs) {
+  std::fprintf(embedded_frame_dump_file,
+               "C %u copyctl=%08X dest_base=%08X dest_pitch=%08X dest_info=%08X surf=%08X "
+               "c0=%08X depth=%08X woff=%08X\n",
+               embedded_frame_dump_copies++, regs[XE_GPU_REG_RB_COPY_CONTROL],
+               regs[XE_GPU_REG_RB_COPY_DEST_BASE], regs[XE_GPU_REG_RB_COPY_DEST_PITCH],
+               regs[XE_GPU_REG_RB_COPY_DEST_INFO], regs[XE_GPU_REG_RB_SURFACE_INFO],
+               regs[XE_GPU_REG_RB_COLOR_INFO], regs[XE_GPU_REG_RB_DEPTH_INFO],
+               regs[XE_GPU_REG_PA_SC_WINDOW_OFFSET]);
 }
 
 void TraceEmbeddedInputToSwap(uint64_t swap_ordinal, bool refresh_succeeded) {
@@ -4442,6 +4559,12 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   vertex_buffers_in_sync_[0] = 0;
   vertex_buffers_in_sync_[1] = 0;
   if (temporal_aa_enabled_) TemporalAaEndFrame();
+  if (embedded_frame_dump_file ||
+      embedded_frame_dump_requested.load(std::memory_order_relaxed)) {
+    EmbeddedFrameDumpAtSwap(guest_frame_count_.load(std::memory_order_relaxed),
+                            render_target_cache_->GetDrawScaleX(),
+                            render_target_cache_->GetDrawScaleY());
+  }
 
   // Occlusion results of earlier frames reach guest memory before the guest
   // can reissue their slots (before this frame's own submission closes).
@@ -5841,6 +5964,11 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   }
   if (!render_target_update_succeeded) {
     return fail_embedded_draw("render_target_update");
+  }
+  if (embedded_frame_dump_file) {
+    EmbeddedFrameDumpDraw(regs, *vertex_shader, pixel_shader, uint32_t(primitive_type),
+                          primitive_processing_result.host_draw_vertex_count, bin_select_,
+                          bin_mask_);
   }
 
   // Ownership transfers have finished, but no guest pipeline has been bound or
@@ -9235,6 +9363,13 @@ void D3D12CommandProcessor::InitializeTrace() {
   }
 }
 
+void D3D12CommandProcessor::OnPredicatedPacketSkipped(uint32_t opcode) {
+  if (!embedded_frame_dump_file) return;
+  std::fprintf(embedded_frame_dump_file, "P skipped opcode=%02X bin_select=%016llX bin_mask=%016llX\n",
+               opcode, static_cast<unsigned long long>(bin_select_),
+               static_cast<unsigned long long>(bin_mask_));
+}
+
 bool D3D12CommandProcessor::IssueCopy() {
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
@@ -9242,6 +9377,7 @@ bool D3D12CommandProcessor::IssueCopy() {
   if (!BeginSubmission(true)) {
     return false;
   }
+  if (embedded_frame_dump_file) EmbeddedFrameDumpCopy(*register_file_);
   if (temporal_aa_enabled_) TemporalAaCopy();
   ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(d3d12_readback_resolve));
   if (readback_mode == ReadbackResolveMode::kDisabled) {

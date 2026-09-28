@@ -54,6 +54,14 @@ struct HostSettingsState {
 // Windows when present) and reports it through *font (null: drawer default).
 ImGuiDrawer::FontSetupCallback HostSettingsFontSetup(ImFont** font);
 
+// A controller's state for the overlay, in XInput layout (wButtons bits, left
+// stick).
+struct OverlayGamepadState {
+  uint16_t buttons = 0;
+  int16_t thumb_lx = 0;
+  int16_t thumb_ly = 0;
+};
+
 // Owned by raw pointer: the owner deletes it outside of drawing, or the
 // dialog closes itself (Resume) and reports that through `close` just before
 // deleting itself (ImGuiDialog::Close semantics).
@@ -62,12 +70,17 @@ class HostSettingsOverlayDialog : public ImGuiDialog {
   using LiveCallback = std::function<void(const settings::Setting&, const std::string&)>;
   using CloseCallback = std::function<void()>;
   using QuitCallback = std::function<void()>;
+  using GamepadCallback = std::function<OverlayGamepadState()>;
 
   // `quit` (optional) adds a "Quit game" button beside Resume; after the
   // player confirms, it asks the owner to end the game (djanice1980, #7).
+  // `gamepad` (optional) is read every frame (djanice1980, #7): the d-pad and
+  // left stick move, A activates, LB/RB step, B cancels a list or, at the top
+  // level, returns to the game.
   HostSettingsOverlayDialog(ImGuiDrawer* imgui_drawer, HostSettingsState& state, ImFont* font,
                             std::string toggle_key_name, LiveCallback live,
-                            CloseCallback close, QuitCallback quit = nullptr);
+                            CloseCallback close, QuitCallback quit = nullptr,
+                            GamepadCallback gamepad = nullptr);
   ~HostSettingsOverlayDialog() override;
 
   // A key editor waits for a key: Escape is then a binding, not "close".
@@ -79,6 +92,8 @@ class HostSettingsOverlayDialog : public ImGuiDialog {
 
  private:
   void Sync();
+  // Feeds the controller into Dear ImGui; returns true on a fresh B press.
+  bool FeedGamepad(ImGuiIO& io);
 
   HostSettingsState& state_;
   ImFont* font_ = nullptr;
@@ -86,6 +101,10 @@ class HostSettingsOverlayDialog : public ImGuiDialog {
   LiveCallback live_;
   CloseCallback close_;
   QuitCallback quit_;
+  GamepadCallback gamepad_;
+  uint16_t gamepad_previous_ = 0;
+  uint16_t gamepad_suppressed_ = 0;
+  bool gamepad_primed_ = false;
   settings::PanelModel model_;
   settings::Schema schema_;
   std::string status_;

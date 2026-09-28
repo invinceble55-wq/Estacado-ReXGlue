@@ -20,6 +20,7 @@
 #include <rex/ui/window.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cmath>
@@ -93,6 +94,27 @@ REXCVAR_DEFINE_STRING(input_bind_guide, "", "Input/Keybinds/Controller", "Guide 
 namespace rex::input::mnk {
 
 using rex::ui::VirtualKey;
+
+// Keyboard diagnostics (#16): focus changes and the first key presses with
+// the state that decides whether they reach the game; a few stderr lines per
+// session (logs\session_*.log with session_log.txt).
+static std::atomic<uint32_t> focus_log_count{0};
+static std::atomic<uint32_t> key_log_count{0};
+
+static void LogFocus(const char* event, bool focus) {
+  if (focus_log_count.fetch_add(1, std::memory_order_relaxed) < 32) {
+    std::fprintf(stderr, "REX_MNK_FOCUS event=%s focus=%d\n", event, focus ? 1 : 0);
+    std::fflush(stderr);
+  }
+}
+
+static void LogKeyDown(uint32_t vk, bool enabled, bool focus, bool active) {
+  if (key_log_count.fetch_add(1, std::memory_order_relaxed) < 16) {
+    std::fprintf(stderr, "REX_MNK_KEY vk=%u enabled=%d focus=%d active=%d\n", vk,
+                 enabled ? 1 : 0, focus ? 1 : 0, active ? 1 : 0);
+    std::fflush(stderr);
+  }
+}
 
 static uint64_t TestTapClockMs() {
   return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -246,6 +268,8 @@ void MnkInputDriver::PumpTestScriptLocked() {
                      static_cast<long long>(TestScriptQpc()), command.text.c_str());
         std::fflush(stderr);
       });
+  test_pad_buttons_.store(TestScriptDrivingLocked() ? test_script_.pad_buttons() : uint16_t(0),
+                          std::memory_order_release);
 }
 
 void MnkInputDriver::OnWindowAvailable(rex::ui::Window* window) {
@@ -256,6 +280,7 @@ void MnkInputDriver::OnWindowAvailable(rex::ui::Window* window) {
     // initial OnGotFocus notification has already happened. Adopt the real
     // window state here instead of assuming a newly attached window is focused.
     has_focus_ = window->HasFocus();
+    LogFocus("attach", has_focus_);
     window->AddInputListener(this, window_z_order());
     window->AddListener(this);
   }
@@ -328,6 +353,26 @@ bool MnkInputDriver::ConsumeMouseLook(uint32_t user_index, int32_t& dx, int32_t&
   script_mouse_dx_ = 0;
   script_mouse_dy_ = 0;
   return true;
+}
+
+// True when any controller binding uses the Enter key (then Enter is only
+// that binding, never the extra A).
+static bool ReturnKeyBound() {
+  const std::string bindings[] = {
+      REXCVAR_GET(input_bind_a), REXCVAR_GET(input_bind_b), REXCVAR_GET(input_bind_x),
+      REXCVAR_GET(input_bind_y), REXCVAR_GET(input_bind_left_trigger),
+      REXCVAR_GET(input_bind_right_trigger), REXCVAR_GET(input_bind_left_shoulder),
+      REXCVAR_GET(input_bind_right_shoulder), REXCVAR_GET(input_bind_lstick_up),
+      REXCVAR_GET(input_bind_lstick_down), REXCVAR_GET(input_bind_lstick_left),
+      REXCVAR_GET(input_bind_lstick_right), REXCVAR_GET(input_bind_lstick_press),
+      REXCVAR_GET(input_bind_rstick_press), REXCVAR_GET(input_bind_dpad_up),
+      REXCVAR_GET(input_bind_dpad_down), REXCVAR_GET(input_bind_dpad_left),
+      REXCVAR_GET(input_bind_dpad_right), REXCVAR_GET(input_bind_back),
+      REXCVAR_GET(input_bind_start), REXCVAR_GET(input_bind_guide)};
+  for (const std::string& binding : bindings) {
+    if (rex::ui::ParseVirtualKey(binding) == rex::ui::VirtualKey::kReturn) return true;
+  }
+  return false;
 }
 
 static bool IsBindPressed(
@@ -413,6 +458,11 @@ X_RESULT MnkInputDriver::GetState(uint32_t user_index, X_INPUT_STATE* out_state)
                          test_taps_enabled ? &test_taps_ : nullptr, test_now_ms);
   };
   if (bind_pressed(REXCVAR_GET(input_bind_a)))
+    buttons |= X_INPUT_GAMEPAD_A;
+  // Enter confirms like A (menus) unless a binding uses it (0.9.2, #16: with
+  // use moved to E in 0.9.1, Space no longer confirmed menus and Enter never
+  // had: players found the keyboard "dead" in menus).
+  if (keys[static_cast<uint16_t>(rex::ui::VirtualKey::kReturn)] && !ReturnKeyBound())
     buttons |= X_INPUT_GAMEPAD_A;
   if (bind_pressed(REXCVAR_GET(input_bind_b)))
     buttons |= X_INPUT_GAMEPAD_B;
@@ -626,9 +676,10 @@ void MnkInputDriver::SetKeyState(uint16_t vk, bool down) {
 }
 
 void MnkInputDriver::OnKeyDown(rex::ui::KeyEvent& e) {
-  if (!IsEnabled())
-    return;
+  const bool enabled = IsEnabled();
   std::lock_guard lock(state_mutex_);
+  LogKeyDown(static_cast<uint32_t>(e.virtual_key()), enabled, has_focus_, is_active());
+  if (!enabled) return;
   if (!has_focus_ || !is_active()) return;
   uint16_t vk = static_cast<uint16_t>(e.virtual_key());
   const uint32_t hold_ms = REXCVAR_GET(input_test_tap_hold_ms);
@@ -705,6 +756,7 @@ void MnkInputDriver::OnMouseWheel(rex::ui::MouseEvent& e) {
 void MnkInputDriver::OnLostFocus(rex::ui::UISetupEvent&) {
   std::lock_guard lock(state_mutex_);
   has_focus_ = false;
+  LogFocus("lost", false);
   test_taps_.Reset();
   std::memset(key_down_, 0, sizeof(key_down_));
   mouse_dx_ = 0;
@@ -730,6 +782,7 @@ void MnkInputDriver::OnLostFocus(rex::ui::UISetupEvent&) {
 void MnkInputDriver::OnGotFocus(rex::ui::UISetupEvent&) {
   std::lock_guard lock(state_mutex_);
   has_focus_ = true;
+  LogFocus("gained", true);
 }
 
 }  // namespace rex::input::mnk

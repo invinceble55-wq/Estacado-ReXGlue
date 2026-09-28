@@ -14,6 +14,7 @@
 #include <rex/ui/window_sdl.h>
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <filesystem>
 
@@ -477,6 +478,16 @@ void WindowSDL::HandleDropEvent(SDL_Event& event) {
 }
 
 void WindowSDL::HandleKeyEvent(SDL_Event& event) {
+  if (event.type == SDL_EVENT_KEY_DOWN) {
+    // Keyboard diagnostics (#16): the first key presses SDL delivered.
+    static int key_logs = 0;  // UI thread
+    if (key_logs < 16) {
+      ++key_logs;
+      std::fprintf(stderr, "REX_SDL_KEY scancode=%d repeat=%d\n", int(event.key.scancode),
+                   event.key.repeat ? 1 : 0);
+      std::fflush(stderr);
+    }
+  }
   VirtualKey virtual_key = TranslateSDLScancode(event.key.scancode);
   if (virtual_key == VirtualKey::kNone) {
     return;

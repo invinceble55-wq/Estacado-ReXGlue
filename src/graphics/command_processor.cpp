@@ -1418,6 +1418,7 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
   if (packet & 1) {
     bool any_pass = (bin_select_ & bin_mask_) != 0;
     if (!any_pass || opcode == PM4_XE_SWAP) {
+      OnPredicatedPacketSkipped(opcode);
       reader->AdvanceRead(count * sizeof(uint32_t));
       trace_writer_.WritePacketEnd();
       return true;

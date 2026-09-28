@@ -20,6 +20,7 @@
 #include <rex/ui/window_listener.h>
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <mutex>
@@ -79,6 +80,9 @@ class MnkInputDriver final : public InputDriver,
     std::lock_guard lock(state_mutex_);
     host_event_callback_ = std::move(callback);
   }
+  // Developer test input: the script's virtual controller buttons (`pad`),
+  // 0 without a driving script. Any thread.
+  uint16_t TestPadButtons() const { return test_pad_buttons_.load(std::memory_order_acquire); }
 
  private:
   void CenterCursor();
@@ -108,6 +112,7 @@ class MnkInputDriver final : public InputDriver,
   int32_t script_mouse_dy_ = 0;
   uint32_t test_script_log_count_ = 0;
   HostEventCallback host_event_callback_;
+  std::atomic<uint16_t> test_pad_buttons_{0};
 
   // Mouse delta tracking
   int32_t mouse_dx_ = 0;

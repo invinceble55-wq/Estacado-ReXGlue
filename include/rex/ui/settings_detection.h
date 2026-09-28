@@ -249,6 +249,9 @@ struct UpscalerRuntimes {
   bool dlss = false;
   bool fsr = false;
   bool xess = false;
+  // NVIDIA DLSS also needs an NVIDIA RTX card; the host checks the adapter
+  // (true when it cannot tell).
+  bool dlss_card = true;
 };
 
 inline UpscalerRuntimes ScanUpscalerRuntimes(const std::filesystem::path& folder) {
@@ -261,8 +264,8 @@ inline UpscalerRuntimes ScanUpscalerRuntimes(const std::filesystem::path& folder
 }
 
 // Temporal AA offers NVIDIA DLAA, AMD FSR 3.1 and Intel XeSS only when their
-// runtime is there (TAA is built in). A current choice without its runtime
-// stays listed, marked: the game uses TAA for it.
+// runtime is there (TAA is built in), and DLSS only on an NVIDIA RTX card. A
+// current choice that cannot run stays listed, marked: the game uses TAA.
 inline void DetectUpscalers(PanelModel& model, const UpscalerRuntimes& runtimes) {
   if (!model.schema) return;
   const Setting* setting = model.schema->Find(kTemporalAaKey);
@@ -274,9 +277,11 @@ inline void DetectUpscalers(PanelModel& model, const UpscalerRuntimes& runtimes)
     const bool missing = (choice.value == "dlss" && !runtimes.dlss) ||
                          (choice.value == "fsr" && !runtimes.fsr) ||
                          (choice.value == "xess" && !runtimes.xess);
-    if (missing) {
+    const bool no_card = choice.value == "dlss" && runtimes.dlss && !runtimes.dlss_card;
+    if (missing || no_card) {
       if (choice.value != current) continue;
-      choice.label += Translate(model.schema, " - not installed, TAA is used");
+      choice.label += Translate(model.schema, no_card ? " - needs an NVIDIA RTX card, TAA is used"
+                                                      : " - not installed, TAA is used");
     }
     choices.push_back(std::move(choice));
   }

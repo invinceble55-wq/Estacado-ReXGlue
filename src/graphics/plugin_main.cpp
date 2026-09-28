@@ -273,6 +273,7 @@ extern "C" REX_GPU_PLUGIN_EXPORT rex::system::IGraphicsSystem* rex_gpu_create(
 #if defined(_WIN32)
 double QueryWindowRefreshHz(void* window);
 uint64_t QueryCardVideoMemoryBytes();
+bool QueryNvidiaRtxCard();
 #endif
 
 namespace {
@@ -326,6 +327,14 @@ class EmbeddedSettingsOverlayListener final : public rex::ui::WindowInputListene
 
   void OnKeyDown(rex::ui::KeyEvent& event) override;
   void Reset();
+  // The controller chord (EmbeddedGamepadOverlayPoller), on the UI thread.
+  void Toggle() {
+    if (dialog_) {
+      Close();
+    } else {
+      Open();
+    }
+  }
 
  private:
   bool EnsureDrawer();
@@ -453,6 +462,10 @@ struct EmbeddedGpu {
   // In-game settings overlay (host schema, rex_gpu_embedded_settings_*).
   rex::ui::HostSettingsState settings_state;
   std::atomic<bool> settings_overlay_open{false};
+  // The controller as the overlay sees it (EmbeddedGamepadOverlayPoller):
+  // XInput buttons, and the left stick packed as (x << 16) | y.
+  std::atomic<uint32_t> overlay_pad_buttons{0};
+  std::atomic<uint32_t> overlay_pad_stick{0};
   // V380: the player closed the window (close button, Alt+F4). The runtime
   // polls this and stops the title cleanly; a watchdog hard-exits if that
   // never completes, so a closed game never keeps running without a window.
@@ -589,6 +602,7 @@ void EmbeddedSettingsOverlayListener::Open() {
 #if !REX_HAVE_XESS
     upscalers.xess = false;
 #endif
+    if (upscalers.dlss) upscalers.dlss_card = QueryNvidiaRtxCard();
     std::lock_guard<std::mutex> lock(embedded_.settings_state.mutex);
     embedded_.settings_state.upscalers = upscalers;
     embedded_.settings_state.upscalers_known = true;
@@ -622,6 +636,14 @@ void EmbeddedSettingsOverlayListener::Open() {
         std::fprintf(stderr, "REX_SETTINGS_OVERLAY quit=1\n");
         std::fflush(stderr);
         static_cast<rex::ui::WindowSDL*>(window_)->PostCloseRequest();
+      },
+      [this]() {
+        const uint32_t stick = embedded_.overlay_pad_stick.load(std::memory_order_acquire);
+        rex::ui::OverlayGamepadState pad;
+        pad.buttons = uint16_t(embedded_.overlay_pad_buttons.load(std::memory_order_acquire));
+        pad.thumb_lx = int16_t(uint16_t(stick >> 16));
+        pad.thumb_ly = int16_t(uint16_t(stick & 0xFFFF));
+        return pad;
       });
   embedded_.settings_overlay_open.store(true, std::memory_order_release);
   std::fprintf(stderr, "REX_SETTINGS_OVERLAY open=1\n");
@@ -685,6 +707,36 @@ void QueueEmbeddedScreenshot(EmbeddedGpu& embedded) {
 }
 
 void EmbeddedScreenshotListener::OnKeyDown(rex::ui::KeyEvent& event) {
+  if (event.virtual_key() == rex::ui::VirtualKey::kF9) {
+    // Play-testing snapshot (#14): a screenshot plus the next whole guest
+    // frame's draws and resolves (diag_<time>_frame.txt beside it). Reads GPU
+    // registers only; idle until pressed.
+    event.set_handled(true);
+    if (event.prev_state()) return;
+    static uint32_t snapshots = 0;
+    std::time_t now = std::time(nullptr);
+    std::tm local{};
+#if defined(_WIN32)
+    localtime_s(&local, &now);
+#else
+    localtime_r(&now, &local);
+#endif
+    char name[64];
+    std::strftime(name, sizeof(name), "diag_%Y%m%d_%H%M%S", &local);
+    const std::filesystem::path path =
+        embedded_.screenshot_root / (std::string(name) + "_" + std::to_string(++snapshots) +
+                                     "_frame.txt");
+    const std::string text = path.u8string();  // UTF-8 (C++17)
+#if REX_HAS_D3D12
+    rex::graphics::d3d12::RequestEmbeddedFrameDump(text.c_str());
+    rex::graphics::d3d12::RequestEmbeddedGameplayCapture();
+#endif
+    QueueEmbeddedScreenshot(embedded_);
+    std::fprintf(stderr, "REX_DIAG_SNAPSHOT key=F9 index=%u frame_dump=%s\n", snapshots,
+                 text.c_str());
+    std::fflush(stderr);
+    return;
+  }
   if (event.virtual_key() != rex::ui::VirtualKey::kF12) {
     return;
   }
@@ -984,6 +1036,93 @@ class EmbeddedShaderPrewarmIndicator {
 };
 #endif
 
+// Opens and closes the settings overlay from a controller: Back + Start
+// together (View + Menu on an Xbox pad, Create + Options on a DualSense
+// through Steam Input). Polls XInput itself (all slots, ~120 Hz), so it works
+// whatever the title does with the pad (the runtime hides the chord from the
+// title, runtime_overlay_chord.h), and publishes the pad for the overlay's
+// navigation. From djanice1980's fork (#7); the developer test script's
+// virtual controller (`pad`) counts like a physical one.
+class EmbeddedGamepadOverlayPoller {
+ public:
+  EmbeddedGamepadOverlayPoller(EmbeddedGpu& embedded, rex::ui::SDLWindowedAppContext& app_context,
+                               EmbeddedSettingsOverlayListener& listener)
+      : embedded_(embedded), app_context_(app_context), listener_(listener) {
+#if defined(_WIN32)
+    if (const HMODULE xinput = LoadLibraryW(L"xinput1_4.dll")) {
+      get_state_ = reinterpret_cast<GetStateFn>(GetProcAddress(xinput, "XInputGetState"));
+    }
+#endif
+    thread_ = std::thread([this] { Run(); });
+  }
+  ~EmbeddedGamepadOverlayPoller() { Stop(); }
+
+  // Before the UI thread's listeners go away: nothing is posted afterwards,
+  // and a toggle already posted does nothing.
+  void Stop() {
+    accepting_->store(false, std::memory_order_release);
+    stop_.store(true, std::memory_order_release);
+    if (thread_.joinable()) thread_.join();
+  }
+
+ private:
+  struct PadState {
+    uint32_t packet;
+    uint16_t buttons;
+    uint8_t left_trigger, right_trigger;
+    int16_t lx, ly, rx, ry;
+  };
+  using GetStateFn = unsigned long(__stdcall*)(unsigned long, PadState*);
+  static constexpr uint16_t kBack = 0x0020, kStart = 0x0010;
+
+  void Run() {
+    uint16_t previous = 0;
+    unsigned idle_polls[4] = {};
+    while (!stop_.load(std::memory_order_acquire)) {
+      uint16_t buttons = 0;
+      int16_t lx = 0, ly = 0;
+      for (unsigned slot = 0; get_state_ && slot < 4; ++slot) {
+        // An empty slot is re-probed about once a second (XInput is slow to
+        // report missing controllers).
+        if (idle_polls[slot] && ++idle_polls[slot] < 120) continue;
+        PadState state{};
+        if (get_state_(slot, &state) != 0) {
+          idle_polls[slot] = 1;
+          continue;
+        }
+        idle_polls[slot] = 0;
+        buttons |= state.buttons;
+        if (std::abs(int(state.lx)) > std::abs(int(lx))) lx = state.lx;
+        if (std::abs(int(state.ly)) > std::abs(int(ly))) ly = state.ly;
+      }
+      if (embedded_.keyboard_mouse) buttons |= embedded_.keyboard_mouse->TestPadButtons();
+      embedded_.overlay_pad_buttons.store(buttons, std::memory_order_release);
+      embedded_.overlay_pad_stick.store((uint32_t(uint16_t(lx)) << 16) | uint16_t(ly),
+                                        std::memory_order_release);
+      const bool chord = (buttons & (kBack | kStart)) == (kBack | kStart);
+      const bool was_chord = (previous & (kBack | kStart)) == (kBack | kStart);
+      if (chord && !was_chord) {
+        std::fprintf(stderr, "REX_SETTINGS_OVERLAY toggle=gamepad\n");
+        std::fflush(stderr);
+        app_context_.CallInUIThreadDeferred(
+            [accepting = accepting_, listener = &listener_]() {
+              if (accepting->load(std::memory_order_acquire)) listener->Toggle();
+            });
+      }
+      previous = buttons;
+      std::this_thread::sleep_for(std::chrono::milliseconds(8));
+    }
+  }
+
+  EmbeddedGpu& embedded_;
+  rex::ui::SDLWindowedAppContext& app_context_;
+  EmbeddedSettingsOverlayListener& listener_;
+  GetStateFn get_state_ = nullptr;
+  std::shared_ptr<std::atomic<bool>> accepting_ = std::make_shared<std::atomic<bool>>(true);
+  std::atomic<bool> stop_{false};
+  std::thread thread_;
+};
+
 bool StartEmbeddedPresentation(EmbeddedGpu& embedded, const char* backend) {
   embedded.presentation_thread = std::thread([&embedded, backend]() {
     rex::ui::SDLWindowedAppContext app_context;
@@ -992,6 +1131,7 @@ bool StartEmbeddedPresentation(EmbeddedGpu& embedded, const char* backend) {
     std::unique_ptr<EmbeddedDebugOverlayListener> debug_overlay_listener;
     std::unique_ptr<EmbeddedDevFrameModeListener> dev_frame_mode_listener;
     std::unique_ptr<EmbeddedSettingsOverlayListener> settings_overlay_listener;
+    std::unique_ptr<EmbeddedGamepadOverlayPoller> gamepad_overlay_poller;
     std::unique_ptr<EmbeddedOverlayInputBlocker> overlay_input_blocker;
 #if REX_HAS_D3D12
     std::unique_ptr<EmbeddedShaderPrewarmIndicator> prewarm_indicator;
@@ -1044,6 +1184,8 @@ bool StartEmbeddedPresentation(EmbeddedGpu& embedded, const char* backend) {
           embedded, window.get(), embedded.graphics.get());
       window->AddInputListener(settings_overlay_listener.get(),
                                std::numeric_limits<size_t>::max() - 3);
+      gamepad_overlay_poller = std::make_unique<EmbeddedGamepadOverlayPoller>(
+          embedded, app_context, *settings_overlay_listener);
       overlay_input_blocker = std::make_unique<EmbeddedOverlayInputBlocker>(embedded);
       window->AddInputListener(overlay_input_blocker.get(), 32);
 #if REX_HAS_D3D12
@@ -1097,6 +1239,10 @@ bool StartEmbeddedPresentation(EmbeddedGpu& embedded, const char* backend) {
       prewarm_indicator.reset();
     }
 #endif
+    if (gamepad_overlay_poller) {
+      gamepad_overlay_poller->Stop();
+      gamepad_overlay_poller.reset();
+    }
     if (window) {
       if (dev_frame_mode_listener) {
         window->RemoveInputListener(dev_frame_mode_listener.get());
@@ -1973,6 +2119,27 @@ uint64_t QueryCardVideoMemoryBytes() {
   factory->Release();
   return bytes;
 }
+
+// NVIDIA DLSS needs an NVIDIA RTX card: the high-performance adapter is an
+// NVIDIA one (vendor 0x10DE) with RTX in its name. True when DXGI can't tell.
+bool QueryNvidiaRtxCard() {
+  IDXGIFactory6* factory = nullptr;
+  if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory6), reinterpret_cast<void**>(&factory)))) {
+    return true;
+  }
+  bool rtx = false;
+  IDXGIAdapter1* adapter = nullptr;
+  if (SUCCEEDED(factory->EnumAdapterByGpuPreference(0, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
+                                                    __uuidof(IDXGIAdapter1),
+                                                    reinterpret_cast<void**>(&adapter)))) {
+    DXGI_ADAPTER_DESC1 desc{};
+    rtx = SUCCEEDED(adapter->GetDesc1(&desc)) && desc.VendorId == 0x10DE &&
+          !(desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) && std::wcsstr(desc.Description, L"RTX");
+    adapter->Release();
+  }
+  factory->Release();
+  return rtx;
+}
 #endif
 
 void RefreshFramePolicy(EmbeddedGpu& embedded, uint64_t tick) {
@@ -2284,6 +2451,14 @@ rex_gpu_embedded_poll_keyboard_mouse(
   output->thumb_rx = static_cast<int16_t>(state.gamepad.thumb_rx);
   output->thumb_ry = static_cast<int16_t>(state.gamepad.thumb_ry);
   return 1;
+}
+
+// Developer test input: the script's virtual controller buttons (`pad`) for
+// the host's native controller path; 0 without a driving script.
+extern "C" REX_GPU_PLUGIN_EXPORT uint32_t rex_gpu_embedded_test_pad_buttons(void* handle) {
+  auto* embedded = static_cast<EmbeddedGpu*>(handle);
+  if (!embedded || !embedded->keyboard_mouse) return 0;
+  return embedded->keyboard_mouse->TestPadButtons();
 }
 
 extern "C" REX_GPU_PLUGIN_EXPORT uint32_t

@@ -11,6 +11,7 @@
 
 #include <rex/ui/windowed_app_context_sdl.h>
 
+#include <cstdio>
 #include <cstdlib>
 
 #include <SDL3/SDL.h>
@@ -98,6 +99,15 @@ void SDLWindowedAppContext::ProcessEvent(SDL_Event& event) {
     case SDL_EVENT_KEY_UP: {
       if (WindowSDL* window = GetWindow(event.key.windowID)) {
         window->HandleKeyEvent(event);
+      } else if (event.type == SDL_EVENT_KEY_DOWN) {
+        // Keyboard diagnostics (#16): SDL had no focused window for the key.
+        static int dropped_logs = 0;  // UI thread
+        if (dropped_logs < 8) {
+          ++dropped_logs;
+          std::fprintf(stderr, "REX_INPUT_KEY_DROPPED window_id=%u scancode=%d\n",
+                       unsigned(event.key.windowID), int(event.key.scancode));
+          std::fflush(stderr);
+        }
       }
       break;
     }

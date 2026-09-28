@@ -37,7 +37,14 @@ namespace rex::input::mnk::test_script_policy {
 //                           stick that never reports the same value twice.
 //                           Scripted and physical axes merge by the larger
 //                           magnitude, like two pads on one user.
-enum class Op : uint8_t { kWait, kDown, kUp, kTap, kMouse, kMark, kArm, kPress, kClick, kStick };
+//   pad <hex>               hold raw XInput buttons (wButtons bits, e.g.
+//                           0030 = Back + Start; `0` releases) on a virtual
+//                           controller that the host treats like a physical
+//                           one: the settings overlay's chord and navigation
+//                           and the runtime's native controller path.
+enum class Op : uint8_t {
+  kWait, kDown, kUp, kTap, kMouse, kMark, kArm, kPress, kClick, kStick, kPad
+};
 
 inline const char* OpName(Op op) {
   switch (op) {
@@ -51,6 +58,7 @@ inline const char* OpName(Op op) {
     case Op::kPress: return "press";
     case Op::kClick: return "click";
     case Op::kStick: return "stick";
+    case Op::kPad: return "pad";
   }
   return "?";
 }
@@ -166,6 +174,15 @@ inline ParseResult ParseLine(std::string_view line, KeyParser parse_key, Command
             (words.size() == 4 ||
              detail::Number<uint32_t>(words[4], command.ms, 0, kMaxStickJitter));
     command.key = words.size() > 1 && words[1] == "R" ? 1 : 0;
+  } else if (verb == "pad") {
+    // dx = the held wButtons bits.
+    command.op = Op::kPad;
+    uint32_t buttons = 0;
+    const std::string_view hex = words.size() == 2 ? words[1] : std::string_view();
+    const auto result = std::from_chars(hex.data(), hex.data() + hex.size(), buttons, 16);
+    valid = !hex.empty() && result.ec == std::errc() && result.ptr == hex.data() + hex.size() &&
+            buttons <= 0xFFFFu;
+    command.dx = int32_t(buttons);
   }
   if (!valid) {
     error = "invalid test input command: " + std::string(line);
@@ -245,16 +262,20 @@ class Runner {
     stick_base_.fill(0);
     stick_jitter_.fill(0);
     sticks_.fill(0);
+    pad_buttons_ = 0;
   }
 
   bool yielded() const { return yielded_; }
-  // A held scripted stick keeps the script driving (local input still yields).
+  // A held scripted stick or pad keeps the script driving (local input still
+  // yields).
   bool idle() const {
     return !active_ && queue_.empty() && !stick_base_[0] && !stick_base_[1] &&
-           !stick_base_[2] && !stick_base_[3];
+           !stick_base_[2] && !stick_base_[3] && !pad_buttons_;
   }
   // Deflections for the current poll (jitter already applied).
   const Sticks& sticks() const { return sticks_; }
+  // The virtual controller's held buttons (`pad`).
+  uint16_t pad_buttons() const { return pad_buttons_; }
 
  private:
   template <typename OnStart>
@@ -287,6 +308,9 @@ class Runner {
             stick_base_[current_.key * 2] = current_.dx;
             stick_base_[current_.key * 2 + 1] = current_.dy;
             stick_jitter_[current_.key] = current_.ms;
+            break;
+          case Op::kPad:
+            pad_buttons_ = uint16_t(current_.dx);
             break;
           default:
             break;
@@ -350,6 +374,7 @@ class Runner {
   std::array<int32_t, 4> stick_base_{};
   std::array<uint32_t, 2> stick_jitter_{};
   Sticks sticks_{};
+  uint16_t pad_buttons_ = 0;
   uint32_t noise_ = 0x9E3779B9u;
 };
 }  // namespace rex::input::mnk::test_script_policy

@@ -21,4 +21,11 @@ void RequestEmbeddedGameplayCapture() noexcept;
 // Only request identity crosses threads, never GPU-thread-owned frame state.
 bool GetEmbeddedGameplayCaptureRequest(uint64_t& generation) noexcept;
 
+// Play-testing snapshot (#14, F9 in the embedded host): the next whole guest
+// frame's draws and resolves are written to `path` (UTF-8), one text line
+// each (shader hashes, render-target, depth, blend and texture-fetch
+// registers). Present in every build and idle until requested; reads only
+// GPU registers, never changes guest or GPU state.
+void RequestEmbeddedFrameDump(const char* path) noexcept;
+
 }  // namespace rex::graphics::d3d12

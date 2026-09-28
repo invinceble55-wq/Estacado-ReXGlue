@@ -342,6 +342,7 @@ class D3D12CommandProcessor : public CommandProcessor {
   bool IssueDraw(xenos::PrimitiveType primitive_type, uint32_t index_count,
                  IndexBufferInfo* index_buffer_info, bool major_mode_explicit) override;
   bool IssueCopy() override;
+  void OnPredicatedPacketSkipped(uint32_t opcode) override;
 
   void InitializeTrace() override;
 

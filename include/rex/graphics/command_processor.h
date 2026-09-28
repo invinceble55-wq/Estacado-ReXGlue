@@ -431,6 +431,9 @@ class CommandProcessor {
 
   uint64_t bin_select_ = 0xFFFFFFFFull;
   uint64_t bin_mask_ = 0xFFFFFFFFull;
+  // A type 3 packet skipped by the predicated-tiling bin check (play-testing
+  // frame dump; no effect otherwise).
+  virtual void OnPredicatedPacketSkipped(uint32_t opcode) { (void)opcode; }
 
   Shader* active_vertex_shader_ = nullptr;
   Shader* active_pixel_shader_ = nullptr;
