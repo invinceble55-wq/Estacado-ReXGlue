@@ -18,6 +18,8 @@
 #include <rex/ui/overlay/achievement_notification.h>
 #include <rex/ui/overlay/achievement_icon_cache.h>
 
+struct ImFont;
+
 namespace rex {
 class Runtime;
 }  // namespace rex
@@ -35,6 +37,11 @@ class AchievementToastDialog : public AchievementNotificationDialog {
   // Thread-safe: safe to call from any thread, including guest threads.
   void Push(const rex::system::AchievementEvent& event) override;
 
+  // Optional UI font (drawn at a size that follows the display height).
+  void SetFont(ImFont* font) { font_ = font; }
+  // True while a toast is queued or on screen.
+  bool Busy();
+
  protected:
   void OnDraw(ImGuiIO& io) override;
 
@@ -50,6 +57,7 @@ class AchievementToastDialog : public AchievementNotificationDialog {
   std::mutex mutex_;
   std::deque<PendingToast> queue_;
   AchievementIconCache icon_cache_;
+  ImFont* font_ = nullptr;
 };
 
 }  // namespace rex::ui

@@ -5051,6 +5051,21 @@ void D3D12TextureCache::NotePromptIconCandidate(D3D12Texture& texture) {
   // The id a shown keycap carries: a reload keeps it while the guest data is
   // unchanged (LoadTextureDataFromResidentMemoryImpl).
   entry.content_id = ComputeTextureContentId(texture);
+  // #18: show the keycap from this load on. Waiting for the next frame's
+  // UpdatePromptIcons let the first draw of a new or reloaded icon texture
+  // show the controller icon for a frame (RMB blinking as RT).
+  if (!prompt_keycaps_.empty() && prompt_icons::KeyboardPromptsWanted() &&
+      size_t(icon) < prompt_keycaps_.size() && !texture.replaced()) {
+    DeferredTextureRelease release;
+    release.submission = command_processor_.GetCurrentSubmission();
+    texture.TakeSRVDescriptors(release.descriptors);
+    deferred_texture_releases_.push_back(std::move(release));
+    texture.ShowReplacement(entry.content_id, prompt_keycaps_[size_t(icon)],
+                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
+                                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    entry.keycap = true;
+    replacement_bindings_dirty_ = true;
+  }
   static uint32_t logged = 0;
   if (logged < 64) {
     ++logged;

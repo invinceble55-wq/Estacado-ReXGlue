@@ -46,10 +46,10 @@ ImGuiDrawer::FontSetupCallback HostSettingsFontSetup(ImFont** font) {
 #if defined(_WIN32)
     const char* path = "C:\\Windows\\Fonts\\segoeui.ttf";
     if (std::filesystem::exists(path)) {
-      // Latin plus Arabic and its presentation forms (the Arabic interface
-      // draws pre-shaped text, rex/ui/rtl_text.h).
-      static const ImWchar kRanges[] = {0x0020, 0x024F, 0x0600, 0x06FF, 0x2000, 0x206F,
-                                        0xFB50, 0xFDFF, 0xFE70, 0xFEFF, 0};
+      // Latin, Cyrillic (Russian interface) plus Arabic and its presentation
+      // forms (the Arabic interface draws pre-shaped text, rex/ui/rtl_text.h).
+      static const ImWchar kRanges[] = {0x0020, 0x024F, 0x0400, 0x04FF, 0x0600, 0x06FF,
+                                        0x2000, 0x206F, 0xFB50, 0xFDFF, 0xFE70, 0xFEFF, 0};
       *font = atlas->AddFontFromFileTTF(path, 18.0f, nullptr, kRanges);
     }
 #endif

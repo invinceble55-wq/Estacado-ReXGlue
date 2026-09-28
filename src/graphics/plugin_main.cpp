@@ -29,6 +29,7 @@
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <deque>
 #include <thread>
 #include <vector>
 
@@ -88,6 +89,7 @@ REXCVAR_DECLARE(std::string, input_bind_start);
 #include <rex/ui/flags.h>
 #include <rex/ui/imgui_drawer.h>
 #include <rex/ui/keybinds.h>
+#include <rex/ui/overlay/achievement_toast.h>
 #include <rex/ui/overlay/debug_overlay.h>
 #include <rex/ui/overlay/host_settings_overlay.h>
 #include <rex/ui/presenter.h>
@@ -286,6 +288,7 @@ constexpr bool kEmbeddedOutputProbeEnabled = false;
 using rex::graphics::ResolveEmbeddedShaderReplacementPackPath;
 
 struct EmbeddedGpu;
+class EmbeddedAchievementToaster;
 
 class EmbeddedScreenshotListener final : public rex::ui::WindowInputListener {
  public:
@@ -478,6 +481,10 @@ struct EmbeddedGpu {
   // polls this and stops the title cleanly; a watchdog hard-exits if that
   // never completes, so a closed game never keeps running without a window.
   std::atomic<bool> close_requested{false};
+  // #22: achievement toasts (rex_gpu_embedded_show_achievement); set while
+  // the presentation thread's toaster exists.
+  std::mutex achievement_toaster_mutex;
+  EmbeddedAchievementToaster* achievement_toaster = nullptr;
 };
 
 template <typename Event>
@@ -1067,6 +1074,107 @@ class EmbeddedShaderPrewarmIndicator {
 };
 #endif
 
+// #22: the host's achievement unlocks as toasts at the bottom right. The
+// drawer and dialog exist only while a toast is queued or shown (no ImGui
+// work in ordinary frames); a small thread hides them once the last one ends.
+class EmbeddedAchievementToaster {
+ public:
+  EmbeddedAchievementToaster(rex::ui::SDLWindowedAppContext& context, rex::ui::Window* window,
+                             rex::graphics::GraphicsSystem* graphics)
+      : context_(context), window_(window), graphics_(graphics) {
+    poller_ = std::thread([this]() { Poll(); });
+  }
+  ~EmbeddedAchievementToaster() { Shutdown(); }
+
+  // Any thread.
+  void Post(rex::system::AchievementEvent event) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (stop_) return;
+    active_ = true;
+    context_.CallInUIThreadDeferred([this, event = std::move(event)]() { Show(event); });
+    condition_.notify_all();
+  }
+
+  // UI thread, before the window goes.
+  void Shutdown() {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      stop_ = true;
+    }
+    condition_.notify_all();
+    if (poller_.joinable()) {
+      poller_.join();
+      context_.ExecutePendingFunctionsFromUIThread();
+    }
+    Hide();
+    if (imgui_drawer_) {
+      imgui_drawer_->SetPresenterAndImmediateDrawer(nullptr, nullptr);
+      imgui_drawer_.reset();
+    }
+    if (immediate_drawer_) {
+      immediate_drawer_->SetPresenter(nullptr);
+      immediate_drawer_.reset();
+    }
+  }
+
+ private:
+  void Poll() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    while (!stop_) {
+      condition_.wait_for(lock, std::chrono::milliseconds(500));
+      if (stop_ || !active_) continue;
+      // Checked on the UI thread, where the dialog lives.
+      context_.CallInUIThreadDeferred([this]() {
+        if (dialog_ && !dialog_->Busy()) Hide();
+      });
+    }
+  }
+  void Show(const rex::system::AchievementEvent& event) {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (stop_) return;
+    }
+    if (!dialog_) {
+      if (!EnsureDrawer()) return;
+      dialog_ = std::make_unique<rex::ui::AchievementToastDialog>(
+          imgui_drawer_.get(), immediate_drawer_.get(), nullptr);
+      dialog_->SetFont(font_);
+    }
+    dialog_->Push(event);
+    std::fprintf(stderr, "REX_ACHIEVEMENT_TOAST id=%08X\n", event.achievement.id);
+    std::fflush(stderr);
+  }
+  void Hide() {
+    dialog_.reset();
+    std::lock_guard<std::mutex> lock(mutex_);
+    active_ = false;
+  }
+  bool EnsureDrawer() {
+    if (imgui_drawer_) return true;
+    if (!window_ || !graphics_ || !graphics_->provider() || !graphics_->presenter()) return false;
+    immediate_drawer_ = graphics_->provider()->CreateImmediateDrawer();
+    if (!immediate_drawer_) return false;
+    immediate_drawer_->SetPresenter(graphics_->presenter());
+    imgui_drawer_ = std::make_unique<rex::ui::ImGuiDrawer>(
+        window_, 56, rex::ui::HostSettingsFontSetup(&font_));
+    imgui_drawer_->SetPresenterAndImmediateDrawer(graphics_->presenter(), immediate_drawer_.get());
+    return true;
+  }
+
+  rex::ui::SDLWindowedAppContext& context_;
+  rex::ui::Window* window_ = nullptr;
+  rex::graphics::GraphicsSystem* graphics_ = nullptr;
+  std::unique_ptr<rex::ui::ImmediateDrawer> immediate_drawer_;
+  std::unique_ptr<rex::ui::ImGuiDrawer> imgui_drawer_;
+  std::unique_ptr<rex::ui::AchievementToastDialog> dialog_;
+  ImFont* font_ = nullptr;
+  std::thread poller_;
+  std::mutex mutex_;
+  std::condition_variable condition_;
+  bool stop_ = false;
+  bool active_ = false;
+};
+
 // Opens and closes the settings overlay from a controller: Back + Start
 // together (View + Menu on an Xbox pad, Create + Options on a DualSense
 // through Steam Input). Polls XInput itself (all slots, ~120 Hz), so it works
@@ -1167,6 +1275,7 @@ bool StartEmbeddedPresentation(EmbeddedGpu& embedded, const char* backend) {
 #if REX_HAS_D3D12
     std::unique_ptr<EmbeddedShaderPrewarmIndicator> prewarm_indicator;
 #endif
+    std::unique_ptr<EmbeddedAchievementToaster> achievement_toaster;
     EmbeddedCloseRequestListener close_request_listener(embedded);
     rex::X_STATUS status = static_cast<rex::X_STATUS>(0xC0000001L);
 
@@ -1223,6 +1332,12 @@ bool StartEmbeddedPresentation(EmbeddedGpu& embedded, const char* backend) {
       prewarm_indicator = std::make_unique<EmbeddedShaderPrewarmIndicator>(
           app_context, window.get(), embedded.graphics.get());
 #endif
+      achievement_toaster = std::make_unique<EmbeddedAchievementToaster>(
+          app_context, window.get(), embedded.graphics.get());
+      {
+        std::lock_guard<std::mutex> lock(embedded.achievement_toaster_mutex);
+        embedded.achievement_toaster = achievement_toaster.get();
+      }
       window->AddListener(&close_request_listener);
       if (embedded.keyboard_mouse) {
         auto* sdl_window = static_cast<rex::ui::WindowSDL*>(window.get());
@@ -1264,6 +1379,14 @@ bool StartEmbeddedPresentation(EmbeddedGpu& embedded, const char* backend) {
     }
 
     embedded.native_window.store(nullptr, std::memory_order_release);
+    if (achievement_toaster) {
+      {
+        std::lock_guard<std::mutex> lock(embedded.achievement_toaster_mutex);
+        embedded.achievement_toaster = nullptr;
+      }
+      achievement_toaster->Shutdown();
+      achievement_toaster.reset();
+    }
 #if REX_HAS_D3D12
     if (prewarm_indicator) {
       prewarm_indicator->Shutdown();
@@ -2395,6 +2518,22 @@ extern "C" REX_GPU_PLUGIN_EXPORT void rex_gpu_embedded_set_menu_state(void* hand
   if (!embedded) return;
   embedded->menu_active.store(in_menu != 0, std::memory_order_release);
   rex::ui::frame_latency::SetMenuState(in_menu != 0);
+}
+
+// #22: shows an achievement toast (UTF-8 name, gamerscore). Any thread; the
+// host decides whether toasts are wanted.
+extern "C" REX_GPU_PLUGIN_EXPORT void rex_gpu_embedded_show_achievement(void* handle,
+                                                                        uint32_t id,
+                                                                        const char* label,
+                                                                        uint32_t gamerscore) {
+  auto* embedded = static_cast<EmbeddedGpu*>(handle);
+  if (!embedded || !label) return;
+  rex::system::AchievementEvent event;
+  event.achievement.id = id;
+  event.achievement.label = label;
+  event.achievement.gamerscore = gamerscore;
+  std::lock_guard<std::mutex> lock(embedded->achievement_toaster_mutex);
+  if (embedded->achievement_toaster) embedded->achievement_toaster->Post(std::move(event));
 }
 
 // GPU busy time of the most recent frames in microseconds, oldest first (the
