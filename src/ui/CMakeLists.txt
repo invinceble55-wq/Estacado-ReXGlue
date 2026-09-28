@@ -6,6 +6,7 @@ set(REXUI_CORE_SOURCES
     graphics_util.cpp
     image_decode.cpp
     imgui_dialog.cpp
+    frame_latency.cpp
     imgui_drawer.cpp
     immediate_drawer.cpp
     keybinds.cpp
@@ -63,6 +64,8 @@ if(REXGLUE_USE_D3D12)
         d3d12/d3d12_submission_tracker.cpp
         d3d12/d3d12_upload_buffer_pool.cpp
         d3d12/d3d12_util.cpp
+        d3d12/streamline_bridge.cpp
+        d3d12/streamline_signature.cpp
     )
 endif()
 
@@ -163,6 +166,20 @@ if(REXGLUE_USE_D3D12)
         # Present statistics diagnostic: desktop compositor vblank counter.
         dwmapi
     )
+    # Optional NVIDIA Streamline (Reflex / PC Latency markers, later Frame
+    # Generation). Headers only: sl.interposer.dll is loaded at run time after
+    # NVIDIA's signature check, so a build without the SDK (player builds
+    # point this elsewhere) compiles the bridge as no-ops.
+    set(REXGLUE_STREAMLINE_SDK_DIR "${REXGLUE_ROOT}/../../build/deps/Streamline_2.14.1" CACHE PATH
+        "NVIDIA Streamline SDK root (include/)")
+    if(WIN32 AND EXISTS "${REXGLUE_STREAMLINE_SDK_DIR}/include/sl.h")
+        target_include_directories(rexui SYSTEM PRIVATE "${REXGLUE_STREAMLINE_SDK_DIR}/include")
+        target_compile_definitions(rexui PRIVATE REX_HAVE_STREAMLINE=1)
+        message(STATUS "  Streamline SDK: ${REXGLUE_STREAMLINE_SDK_DIR}")
+    else()
+        target_compile_definitions(rexui PRIVATE REX_HAVE_STREAMLINE=0)
+        message(STATUS "  Streamline SDK: not found (${REXGLUE_STREAMLINE_SDK_DIR})")
+    endif()
 endif()
 
 

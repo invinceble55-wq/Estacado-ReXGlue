@@ -426,6 +426,9 @@ class Presenter {
     uint32_t display_aspect_ratio_x;
     uint32_t display_aspect_ratio_y;
     bool is_8bpc;
+    // The guest frame of this image (rex/ui/frame_latency.h; 0 when not
+    // tracked).
+    uint32_t latency_frame;
 
     GuestOutputProperties() { SetToInactive(); }
 
@@ -440,6 +443,7 @@ class Presenter {
       display_aspect_ratio_x = 0;
       display_aspect_ratio_y = 0;
       is_8bpc = false;
+      latency_frame = 0;
     }
   };
 

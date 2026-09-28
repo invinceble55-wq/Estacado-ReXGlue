@@ -73,6 +73,12 @@ REXCVAR_DEFINE_INT32(d3d12_pipeline_creation_threads, -1, "GPU/D3D12",
 REXCVAR_DEFINE_BOOL(d3d12_tessellation_wireframe, false, "GPU/D3D12",
                     "Render tessellation as wireframe");
 
+REXCVAR_DEFINE_BOOL(d3d12_absolute_polygon_offset, true, "GPU/D3D12",
+                    "With host render targets, apply the constant polygon offset as the absolute "
+                    "depth offset it is on the Xenos (through the NDC Z offset) instead of a "
+                    "Direct3D 12 depth bias in format units, which is many times smaller at small "
+                    "depths (reversed depth, shadow maps)");
+
 REXCVAR_DEFINE_BOOL(d3d12_pipeline_storage_seed, true, "GPU/D3D12",
                     "Merge the packaged shader/pipeline seed (runtime_data/pipeline_seed) into "
                     "the persistent storage before preloading it")
@@ -1598,8 +1604,13 @@ bool PipelineCache::GetCurrentStateDescription(
     float polygon_offset, polygon_offset_scale;
     draw_util::GetPreferredFacePolygonOffset(regs, primitive_polygonal, polygon_offset_scale,
                                              polygon_offset);
-    description_out.depth_bias = draw_util::GetD3D10IntegerPolygonOffset(
-        regs.Get<reg::RB_DEPTH_INFO>().depth_format, polygon_offset);
+    // With d3d12_absolute_polygon_offset, the constant term is added to the NDC
+    // Z offset instead (D3D12CommandProcessor::UpdateSystemConstantValues).
+    description_out.depth_bias =
+        REXCVAR_GET(d3d12_absolute_polygon_offset)
+            ? 0
+            : draw_util::GetD3D10IntegerPolygonOffset(
+                  regs.Get<reg::RB_DEPTH_INFO>().depth_format, polygon_offset);
     description_out.depth_bias_slope_scaled =
         polygon_offset_scale * xenos::kPolygonOffsetScaleSubpixelUnit;
     description_out.resolution_scale_native =

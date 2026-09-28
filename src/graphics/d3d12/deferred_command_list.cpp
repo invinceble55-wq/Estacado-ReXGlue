@@ -16,7 +16,31 @@
 #include <rex/graphics/flags.h>
 #include <rex/math.h>
 
+// Diagnostics for artifacts seen only on some GPU generations (#16, #20): a
+// missing barrier between GPU passes shows as stale or partly written blocks
+// on hardware that overlaps the passes, and not on hardware that happens to
+// serialize them.
+REXCVAR_DEFINE_BOOL(d3d12_conservative_sync, false, "GPU/D3D12",
+                    "Diagnostics: a global UAV and aliasing barrier before and after every "
+                    "clear, copy, dispatch, resolve and draw (finds missing barriers; slow)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 namespace rex::graphics::d3d12 {
+
+namespace {
+// Completes and makes visible every earlier GPU write before later work: any
+// UAV access (null UAV barrier) and any placed or reserved resource (null
+// aliasing barrier, which also flushes caches).
+void ConservativeSyncBarrier(ID3D12GraphicsCommandList* command_list) {
+  D3D12_RESOURCE_BARRIER barriers[2] = {};
+  barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+  barriers[0].UAV.pResource = nullptr;
+  barriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_ALIASING;
+  barriers[1].Aliasing.pResourceBefore = nullptr;
+  barriers[1].Aliasing.pResourceAfter = nullptr;
+  command_list->ResourceBarrier(2, barriers);
+}
+}  // namespace
 
 DeferredCommandList::DeferredCommandList(const D3D12CommandProcessor& command_processor,
                                          size_t initial_size)
@@ -41,6 +65,7 @@ void DeferredCommandList::ExecuteStream(const uintmax_t* stream, size_t stream_s
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
   size_t stream_remaining = stream_size;
   ID3D12PipelineState* current_pipeline_state = nullptr;
+  const bool conservative_sync = REXCVAR_GET(d3d12_conservative_sync);
   while (stream_remaining != 0) {
     const CommandHeader& header = *reinterpret_cast<const CommandHeader*>(stream);
     stream += kCommandHeaderSizeElements;
@@ -48,61 +73,79 @@ void DeferredCommandList::ExecuteStream(const uintmax_t* stream, size_t stream_s
     switch (header.command) {
       case Command::kD3DClearDepthStencilView: {
         auto& args = *reinterpret_cast<const ClearDepthStencilViewHeader*>(stream);
+        if (conservative_sync) ConservativeSyncBarrier(command_list);
         command_list->ClearDepthStencilView(
             args.depth_stencil_view, args.clear_flags, args.depth, args.stencil, args.num_rects,
             args.num_rects ? reinterpret_cast<const D3D12_RECT*>(&args + 1) : nullptr);
       } break;
       case Command::kD3DClearRenderTargetView: {
         auto& args = *reinterpret_cast<const ClearRenderTargetViewHeader*>(stream);
+        if (conservative_sync) ConservativeSyncBarrier(command_list);
         command_list->ClearRenderTargetView(
             args.render_target_view, args.color_rgba, args.num_rects,
             args.num_rects ? reinterpret_cast<const D3D12_RECT*>(&args + 1) : nullptr);
       } break;
       case Command::kD3DClearUnorderedAccessViewUint: {
         auto& args = *reinterpret_cast<const ClearUnorderedAccessViewHeader*>(stream);
+        if (conservative_sync) ConservativeSyncBarrier(command_list);
         command_list->ClearUnorderedAccessViewUint(
             args.view_gpu_handle_in_current_heap, args.view_cpu_handle, args.resource,
             args.values_uint, args.num_rects,
             args.num_rects ? reinterpret_cast<const D3D12_RECT*>(&args + 1) : nullptr);
+        if (conservative_sync) ConservativeSyncBarrier(command_list);
       } break;
       case Command::kD3DCopyBufferRegion: {
         auto& args = *reinterpret_cast<const D3DCopyBufferRegionArguments*>(stream);
+        if (conservative_sync) ConservativeSyncBarrier(command_list);
         command_list->CopyBufferRegion(args.dst_buffer, args.dst_offset, args.src_buffer,
                                        args.src_offset, args.num_bytes);
+        if (conservative_sync) ConservativeSyncBarrier(command_list);
       } break;
       case Command::kD3DCopyResource: {
         auto& args = *reinterpret_cast<const D3DCopyResourceArguments*>(stream);
+        if (conservative_sync) ConservativeSyncBarrier(command_list);
         command_list->CopyResource(args.dst_resource, args.src_resource);
+        if (conservative_sync) ConservativeSyncBarrier(command_list);
       } break;
       case Command::kCopyTexture: {
         auto& args = *reinterpret_cast<const CopyTextureArguments*>(stream);
+        if (conservative_sync) ConservativeSyncBarrier(command_list);
         command_list->CopyTextureRegion(&args.dst, 0, 0, 0, &args.src, nullptr);
+        if (conservative_sync) ConservativeSyncBarrier(command_list);
       } break;
       case Command::kD3DCopyTextureRegion: {
         auto& args = *reinterpret_cast<const D3DCopyTextureRegionArguments*>(stream);
+        if (conservative_sync) ConservativeSyncBarrier(command_list);
         command_list->CopyTextureRegion(&args.dst, args.dst_x, args.dst_y, args.dst_z, &args.src,
                                         args.has_src_box ? &args.src_box : nullptr);
+        if (conservative_sync) ConservativeSyncBarrier(command_list);
       } break;
       case Command::kD3DDispatch: {
         if (current_pipeline_state != nullptr) {
           auto& args = *reinterpret_cast<const D3DDispatchArguments*>(stream);
+          if (conservative_sync) ConservativeSyncBarrier(command_list);
           command_list->Dispatch(args.thread_group_count_x, args.thread_group_count_y,
                                  args.thread_group_count_z);
+          if (conservative_sync) ConservativeSyncBarrier(command_list);
         }
       } break;
       case Command::kD3DDrawIndexedInstanced: {
         if (current_pipeline_state != nullptr) {
           auto& args = *reinterpret_cast<const D3DDrawIndexedInstancedArguments*>(stream);
+          if (conservative_sync) ConservativeSyncBarrier(command_list);
           command_list->DrawIndexedInstanced(args.index_count_per_instance, args.instance_count,
                                              args.start_index_location, args.base_vertex_location,
                                              args.start_instance_location);
+          if (conservative_sync) ConservativeSyncBarrier(command_list);
         }
       } break;
       case Command::kD3DDrawInstanced: {
         if (current_pipeline_state != nullptr) {
           auto& args = *reinterpret_cast<const D3DDrawInstancedArguments*>(stream);
+          if (conservative_sync) ConservativeSyncBarrier(command_list);
           command_list->DrawInstanced(args.vertex_count_per_instance, args.instance_count,
                                       args.start_vertex_location, args.start_instance_location);
+          if (conservative_sync) ConservativeSyncBarrier(command_list);
         }
       } break;
       case Command::kD3DBeginQuery: {
@@ -121,9 +164,11 @@ void DeferredCommandList::ExecuteStream(const uintmax_t* stream, size_t stream_s
       } break;
       case Command::kD3DResolveSubresource: {
         auto& args = *reinterpret_cast<const D3DResolveSubresourceArguments*>(stream);
+        if (conservative_sync) ConservativeSyncBarrier(command_list);
         command_list->ResolveSubresource(
             args.destination_resource, args.destination_subresource,
             args.source_resource, args.source_subresource, args.format);
+        if (conservative_sync) ConservativeSyncBarrier(command_list);
       } break;
       case Command::kD3DIASetIndexBuffer: {
         auto view = reinterpret_cast<const D3D12_INDEX_BUFFER_VIEW*>(stream);
@@ -294,8 +339,10 @@ void DeferredCommandList::ExecuteStream(const uintmax_t* stream, size_t stream_s
       } break;
       case Command::kExternalCall: {
         auto& args = *reinterpret_cast<const ExternalCallHeader*>(stream);
+        if (conservative_sync) ConservativeSyncBarrier(command_list);
         args.function(reinterpret_cast<const uint8_t*>(stream) + sizeof(ExternalCallHeader),
                       command_list);
+        if (conservative_sync) ConservativeSyncBarrier(command_list);
         // The call may have set its own pipeline.
         current_pipeline_state = nullptr;
       } break;

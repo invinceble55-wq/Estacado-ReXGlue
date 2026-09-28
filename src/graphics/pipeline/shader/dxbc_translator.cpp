@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdio>
 #include <cstring>
 #include <memory>
 
@@ -27,6 +28,13 @@
 REXCVAR_DEFINE_BOOL(dxbc_switch, true, "GPU/Shader", "Use switch statements in DXBC");
 
 REXCVAR_DEFINE_BOOL(dxbc_source_map, false, "GPU/Shader", "Generate source maps for DXBC");
+
+// #6 test (dev): vertex shader float math marked precise, so the driver
+// neither fuses the guest's multiply-adds nor reassociates (console-like
+// rounding for the shadow-volume extrusion decision at the light's edge).
+REXCVAR_DEFINE_BOOL(dxbc_precise_vertex_math, false, "GPU/Shader",
+                    "Test: precise (unfused) float math in translated vertex shaders")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 REXCVAR_DEFINE_STRING(d3d12_shader_generator_salt, "", "GPU/Shader",
                       "Measurement only: text added to the generator name of translated "
@@ -782,6 +790,16 @@ void DxbcShaderTranslator::StartPixelShader() {
 }
 
 void DxbcShaderTranslator::StartTranslation() {
+  {
+    const bool precise = is_vertex_shader() && REXCVAR_GET(dxbc_precise_vertex_math);
+    a_.SetPreciseFloatMath(precise);
+    static bool precise_logged = false;
+    if (precise && !precise_logged) {
+      precise_logged = true;
+      std::fprintf(stderr, "REX_DXBC_PRECISE_VERTEX_MATH enabled=1\n");
+      std::fflush(stderr);
+    }
+  }
   // Set up the input and output registers.
   Modification shader_modification = GetDxbcShaderModification();
   uint32_t interpolator_register_mask = GetModificationInterpolatorMask();

@@ -22,6 +22,7 @@
 #include <rex/ui/guest_frame_limiter.h>
 #include <rex/ui/presenter.h>
 #include <rex/ui/window.h>
+#include <rex/ui/frame_latency.h>
 
 #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
 #include <ffx_api/ffx_api.h>
@@ -617,6 +618,8 @@ bool Presenter::RefreshGuestOutput(
   writable_properties.display_aspect_ratio_x = display_aspect_ratio_x;
   writable_properties.display_aspect_ratio_y = display_aspect_ratio_y;
   writable_properties.is_8bpc = false;
+  // Called within the command processor's swap of this frame.
+  writable_properties.latency_frame = frame_latency::RenderSubmitFrame();
   bool is_active = writable_properties.IsActive();
   bool refreshed = false;
   bool publish = true;

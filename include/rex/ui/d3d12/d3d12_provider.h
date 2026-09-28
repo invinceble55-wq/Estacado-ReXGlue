@@ -36,6 +36,10 @@ class D3D12Provider : public GraphicsProvider {
   IDXGraphicsAnalysis* GetGraphicsAnalysis() const { return graphics_analysis_; }
   ID3D12Device* GetDevice() const { return device_; }
   ID3D12CommandQueue* GetDirectQueue() const { return direct_queue_; }
+  // For swap chain creation only: NVIDIA Streamline's proxies while it is
+  // active (its present hooks need them), otherwise the native objects.
+  IDXGIFactory2* GetSwapChainFactory() const;
+  ID3D12CommandQueue* GetSwapChainQueue() const;
 
   uint32_t GetDescriptorSize(D3D12_DESCRIPTOR_HEAP_TYPE type) const {
     return descriptor_sizes_[type];

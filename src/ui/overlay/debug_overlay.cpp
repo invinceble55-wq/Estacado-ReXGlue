@@ -12,6 +12,9 @@
 #include <rex/ui/overlay/debug_overlay.h>
 #include <rex/version.h>
 #include <imgui.h>
+#if REX_HAS_D3D12
+#include <rex/ui/d3d12/streamline_bridge.h>
+#endif
 #ifdef REXGLUE_ENABLE_PERF_COUNTERS
 #include <rex/perf/counter.h>
 #include <cinttypes>
@@ -37,6 +40,15 @@ void DebugOverlayDialog::OnDraw(ImGuiIO& io) {
       auto stats = stats_provider_();
       if (stats.frame_count > 0) {
         ImGui::Text("Guest: %.1f FPS (%.2f ms)", stats.fps, stats.frame_time_ms);
+#if REX_HAS_D3D12
+        // Generated frames never count as rendered: the guest line above is
+        // rendered frames; this one adds DLSS Frame Generation's.
+        if (const uint32_t per_frame = d3d12::streamline::FrameGenerationPresentedPerFrame();
+            per_frame > 1) {
+          ImGui::Text("Displayed: %.0f FPS (rendered x%u, DLSS Frame Generation)",
+                      stats.fps * per_frame, per_frame);
+        }
+#endif
       }
     }
 #ifdef REXGLUE_ENABLE_PERF_COUNTERS

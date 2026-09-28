@@ -70,6 +70,8 @@ REXCVAR_DECLARE(std::string, input_bind_start);
 #include <rex/ui/settings_detection.h>
 #include <rex/ui/guest_frame_limiter.h>
 #include <rex/ui/frame_rate_policy.h>
+#include <rex/ui/frame_latency.h>
+#include <rex/ui/d3d12/streamline_bridge.h>
 #include <rex/audio/xma/decoder.h>
 #include <rex/crypto/sha256.h>
 #include <rex/graphics/embedded_debug_overlay_policy.h>
@@ -383,6 +385,8 @@ constexpr DevFrameMode kDevFrameModes[] = {
     {"vsync_half_refresh", 0, 0, 2}, {"limit60_immediate", 60, 1, 0},
     {"limit45_immediate", 45, 1, 0}, {"limit120_vsync", 120, 0, 1},
     {"limit144_immediate", 144, 1, 0},
+    // Below The Darkness's MSAA threshold (it renders 2x instead of 4x MSAA).
+    {"limit30_immediate", 30, 1, 0},
 };
 
 class EmbeddedDevFrameModeListener final : public rex::ui::WindowInputListener {
@@ -435,6 +439,8 @@ struct EmbeddedGpu {
   uint64_t frame_waits = 0;
   uint64_t frame_background_capped = 0;
   bool frame_limiter_announced = false;
+  // The runtime reports the title's frame start (rex_gpu_embedded_frame_start).
+  std::atomic<bool> frame_start_reported{false};
 #if defined(_WIN32)
   HANDLE frame_timer = nullptr;
 #endif
@@ -734,6 +740,20 @@ void EmbeddedScreenshotListener::OnKeyDown(rex::ui::KeyEvent& event) {
     QueueEmbeddedScreenshot(embedded_);
     std::fprintf(stderr, "REX_DIAG_SNAPSHOT key=F9 index=%u frame_dump=%s\n", snapshots,
                  text.c_str());
+#if REX_GPU_DIAGNOSTICS && defined(_WIN32)
+    // Measurement builds with RenderDoc loaded: F9 also asks for a capture of
+    // one whole guest frame (renderdoc/f9_<n> beside the capture request), so
+    // a play-tester's key press marks the exact frame to analyse.
+    if (const char* request = std::getenv("REX_RENDERDOC_CAPTURE_REQUEST");
+        request && *request && std::getenv("REX_RENDERDOC_DLL")) {
+      const std::filesystem::path request_path = std::filesystem::u8path(request);
+      const std::string capture_template =
+          (request_path.parent_path() / "renderdoc" / ("f9_" + std::to_string(snapshots)))
+              .u8string();
+      std::ofstream(request_path, std::ios::binary | std::ios::trunc) << capture_template << "|1";
+      std::fprintf(stderr, "REX_RENDERDOC_F9_REQUEST template=%s\n", capture_template.c_str());
+    }
+#endif
     std::fflush(stderr);
     return;
   }
@@ -1740,7 +1760,8 @@ extern "C" REX_GPU_PLUGIN_EXPORT void* rex_gpu_embedded_create(
       "draw_resolution_scale_threshold=%s native_grid_rules=%s "
       "swap_post_effect=%s anisotropic_override=%s motion_blur=%s "
       "letterbox=%s overscan_cutoff=%s safe_area_x=%s safe_area_y=%s "
-      "present_mode=%s max_frame_latency=%s frame_limit=%s frame_rate=%s vsync_interval=%s gameplay_fov=%s "
+      "present_mode=%s max_frame_latency=%s low_latency=%s frame_limit=%s frame_rate=%s "
+      "vsync_interval=%s gameplay_fov=%s "
       "keyboard_mouse=%s keyboard_mouse_user=%s mouse_sensitivity=%s "
       "mouse_acceleration=%s mouse_smoothing=%s mouse_invert_y=%s mouse_look=%s\n",
       effective_setting("window_mode").c_str(),
@@ -1760,6 +1781,7 @@ extern "C" REX_GPU_PLUGIN_EXPORT void* rex_gpu_embedded_create(
       effective_setting("present_safe_area_y").c_str(),
       effective_setting("display_present_mode").c_str(),
       effective_setting("display_max_frame_latency").c_str(),
+      effective_setting("display_low_latency").c_str(),
       effective_setting("display_frame_limit").c_str(),
       effective_setting("display_frame_rate").c_str(),
       effective_setting("display_vsync_interval").c_str(),
@@ -2225,6 +2247,12 @@ void MaybeWritePgoProfile() {
 extern "C" REX_GPU_PLUGIN_EXPORT void rex_gpu_embedded_frame_boundary(void* handle) {
   auto* embedded = static_cast<EmbeddedGpu*>(handle);
   if (!embedded) return;
+  // Frame tracking (low latency, NVIDIA Streamline): this frame is built and
+  // will be swapped. A runtime without the frame start report starts it here.
+  if (!embedded->frame_start_reported.load(std::memory_order_relaxed)) {
+    rex::ui::frame_latency::FrameStart();
+  }
+  rex::ui::frame_latency::FrameBuilt();
 #if defined(REXGLUE_PGO_GENERATE)
   MaybeWritePgoProfile();
 #endif
@@ -2262,6 +2290,15 @@ extern "C" REX_GPU_PLUGIN_EXPORT void rex_gpu_embedded_frame_boundary(void* hand
 #endif
   const int32_t dev_limit = embedded->dev_frame_limit_override.load(std::memory_order_acquire);
   uint32_t target = dev_limit >= 0 ? uint32_t(dev_limit) : embedded->frame_policy.limit_fps;
+#if REX_HAS_D3D12
+  // NVIDIA DLSS Frame Generation presents N frames per rendered frame: the
+  // frame rate setting is the displayed rate, so render at 1/N of it (at the
+  // full rate the frames queue up behind the display instead).
+  if (const uint32_t presented = rex::ui::d3d12::streamline::FrameGenerationPresentedPerFrame();
+      presented > 1 && target) {
+    target = std::max(1u, target / presented);
+  }
+#endif
 #if defined(_WIN32)
   void* window = embedded->native_window.load(std::memory_order_acquire);
   if (window && IsIconic(static_cast<HWND>(window)) &&
@@ -2311,6 +2348,33 @@ extern "C" REX_GPU_PLUGIN_EXPORT void rex_gpu_embedded_frame_boundary(void* hand
   }
 }
 
+// Called by the embedded runtime at the title's frame start (its frame driver
+// on the producer thread, before the frame-pool wait and input processing):
+// the low-latency frame-queue limit and NVIDIA Reflex wait here, so the title
+// reads its input closer to the display. Never touches guest state.
+extern "C" REX_GPU_PLUGIN_EXPORT void rex_gpu_embedded_frame_start(void* handle) {
+  auto* embedded = static_cast<EmbeddedGpu*>(handle);
+  if (!embedded) return;
+  embedded->frame_start_reported.store(true, std::memory_order_relaxed);
+  rex::ui::frame_latency::FrameStart();
+}
+
+// Called by the embedded runtime when the title's input processor runs for
+// the frame (after the frame-pool wait): the input sample marker and the
+// input-to-present measurement. Never touches guest state.
+extern "C" REX_GPU_PLUGIN_EXPORT void rex_gpu_embedded_input_sample(void* handle) {
+  if (!handle) return;
+  rex::ui::frame_latency::InputSample();
+}
+
+// Called by the embedded runtime's VdSwap once the frame's swap command is
+// written (before the title makes it visible to the command processor), for
+// the frame tracking. Never touches guest state.
+extern "C" REX_GPU_PLUGIN_EXPORT void rex_gpu_embedded_guest_swap(void* handle) {
+  if (!handle) return;
+  rex::ui::frame_latency::GuestSwap();
+}
+
 // The host's view of the title: nonzero while the front end, a loading screen
 // or a modal menu is up (display_menu_frame_rate paces those). Read state only.
 extern "C" REX_GPU_PLUGIN_EXPORT void rex_gpu_embedded_set_menu_state(void* handle,
@@ -2318,6 +2382,7 @@ extern "C" REX_GPU_PLUGIN_EXPORT void rex_gpu_embedded_set_menu_state(void* hand
   auto* embedded = static_cast<EmbeddedGpu*>(handle);
   if (!embedded) return;
   embedded->menu_active.store(in_menu != 0, std::memory_order_release);
+  rex::ui::frame_latency::SetMenuState(in_menu != 0);
 }
 
 // GPU busy time of the most recent frames in microseconds, oldest first (the

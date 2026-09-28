@@ -57,6 +57,25 @@ REXCVAR_DEFINE_STRING(render_target_path_d3d12, "", "GPU/D3D12",
                       "D3D12 render target implementation path")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
+// Black 4x8-pixel cells on some GPU generations (#16) match single 256-byte
+// blocks of a 64bpp render target, the granularity of colour compression.
+// Simultaneous access keeps a resource from being compressed at all.
+REXCVAR_DEFINE_BOOL(d3d12_render_target_uncompressed, false, "GPU/D3D12",
+                    "Diagnostics: create single-sample colour render targets with simultaneous "
+                    "access, which keeps the GPU from compressing them (finds compression "
+                    "problems; slower)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+// Without a pixel shader stencil output (NVIDIA), a depth transfer clears the
+// stencil of the transferred rectangles and rebuilds it bit by bit. The game
+// runs one every frame (above 1x from the scaled 4x MSAA depth into a native
+// buffer), and a stencil-only rectangle clear of a compressed 64bpp buffer is
+// an unusual driver path; 4x8-pixel tiles with a stale stencil would hide the
+// lamps' light or add shadows there (#16 dots, #20 bands).
+REXCVAR_DEFINE_BOOL(d3d12_transfer_stencil_clear_by_draw, false, "GPU/D3D12",
+                    "Diagnostics: depth render target transfers clear the stencil of the "
+                    "transferred rectangles by drawing instead of with ClearDepthStencilView")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 REXCVAR_DEFINE_BOOL(native_stencil_value_output, true, "GPU", "Enable native stencil value output");
 
 REXCVAR_DEFINE_BOOL(
@@ -936,6 +955,55 @@ bool D3D12RenderTargetCache::Initialize() {
         uint32_rtv_clear_pipeline->SetName(
             reinterpret_cast<LPCWSTR>(uint32_rtv_clear_pipeline_name.c_str()));
       }
+    }
+
+    // d3d12_transfer_stencil_clear_by_draw: stencil REPLACE with the
+    // reference 0 over a full-viewport triangle, depth untouched. A missing
+    // pipeline falls back to ClearDepthStencilView.
+    if (REXCVAR_GET(d3d12_transfer_stencil_clear_by_draw)) {
+      D3D12_GRAPHICS_PIPELINE_STATE_DESC stencil_clear_pipeline_desc = {};
+      stencil_clear_pipeline_desc.pRootSignature = uint32_rtv_clear_root_signature_;
+      stencil_clear_pipeline_desc.VS.pShaderBytecode = shaders::fullscreen_cw_vs;
+      stencil_clear_pipeline_desc.VS.BytecodeLength = sizeof(shaders::fullscreen_cw_vs);
+      stencil_clear_pipeline_desc.SampleMask = UINT_MAX;
+      stencil_clear_pipeline_desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+      stencil_clear_pipeline_desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+      stencil_clear_pipeline_desc.RasterizerState.DepthClipEnable = FALSE;
+      D3D12_DEPTH_STENCIL_DESC& stencil_clear_depth_stencil =
+          stencil_clear_pipeline_desc.DepthStencilState;
+      stencil_clear_depth_stencil.DepthEnable = FALSE;
+      stencil_clear_depth_stencil.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+      stencil_clear_depth_stencil.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+      stencil_clear_depth_stencil.StencilEnable = TRUE;
+      stencil_clear_depth_stencil.StencilReadMask = UINT8_MAX;
+      stencil_clear_depth_stencil.StencilWriteMask = UINT8_MAX;
+      stencil_clear_depth_stencil.FrontFace.StencilFailOp = D3D12_STENCIL_OP_KEEP;
+      stencil_clear_depth_stencil.FrontFace.StencilDepthFailOp = D3D12_STENCIL_OP_KEEP;
+      stencil_clear_depth_stencil.FrontFace.StencilPassOp = D3D12_STENCIL_OP_REPLACE;
+      stencil_clear_depth_stencil.FrontFace.StencilFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+      stencil_clear_depth_stencil.BackFace = stencil_clear_depth_stencil.FrontFace;
+      stencil_clear_pipeline_desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+      stencil_clear_pipeline_desc.NumRenderTargets = 0;
+      for (size_t i = 0; i < 2; ++i) {
+        stencil_clear_pipeline_desc.DSVFormat = GetDepthDSVDXGIFormat(
+            i ? xenos::DepthRenderTargetFormat::kD24FS8 : xenos::DepthRenderTargetFormat::kD24S8);
+        for (size_t j = size_t(xenos::MsaaSamples::k1X); j <= size_t(xenos::MsaaSamples::k4X); ++j) {
+          // All samples like ClearDepthStencilView (2x as 4x included).
+          stencil_clear_pipeline_desc.SampleDesc.Count =
+              (xenos::MsaaSamples(j) == xenos::MsaaSamples::k2X && !msaa_2x_supported_)
+                  ? 4
+                  : UINT(1) << j;
+          if (FAILED(device->CreateGraphicsPipelineState(
+                  &stencil_clear_pipeline_desc,
+                  IID_PPV_ARGS(&transfer_stencil_clear_pipelines_[i][j])))) {
+            transfer_stencil_clear_pipelines_[i][j] = nullptr;
+          }
+        }
+      }
+      std::fprintf(stderr, "REX_GPU_TEST_SWITCHES transfer_stencil_clear_by_draw=%u\n",
+                   transfer_stencil_clear_pipelines_[1][size_t(xenos::MsaaSamples::k1X)] ? 1u
+                                                                                        : 0u);
+      std::fflush(stderr);
     }
 
     // FXC-compiled depth / stencil dumping shader is ~2 KB, reserve 4 KB for
@@ -2205,6 +2273,7 @@ void D3D12RenderTargetCache::Shutdown(bool from_destructor) {
 
   for (size_t i = 0; i < 2; ++i) {
     for (size_t j = size_t(xenos::MsaaSamples::k1X); j <= size_t(xenos::MsaaSamples::k4X); ++j) {
+      ui::d3d12::util::ReleaseAndNull(transfer_stencil_clear_pipelines_[i][j]);
       ui::d3d12::util::ReleaseAndNull(uint32_rtv_clear_pipelines_[i][j]);
     }
   }
@@ -2486,6 +2555,13 @@ void D3D12RenderTargetCache::WriteEdramUintPow2UAVDescriptor(D3D12_CPU_DESCRIPTO
                                 provider.OffsetViewDescriptor(edram_buffer_descriptor_heap_start_,
                                                               uint32_t(descriptor_index)),
                                 D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+}
+
+// Whether the dump for this resolve writes the pixel-centre depth of 2x MSAA
+// depth render targets (see resolve_depth_pixel_center).
+static bool IsResolveDumpingDepthCenter(const draw_util::ResolveInfo& resolve_info) {
+  return REXCVAR_GET(resolve_depth_pixel_center) &&
+         resolve_info.rb_copy_control.copy_src_select >= xenos::kMaxColorRenderTargets;
 }
 
 bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMemory& shared_memory,
@@ -2789,7 +2865,8 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
           D3D12CommandProcessor::GpuTimingScope dump_timing(command_processor_,
                                                             GpuTimingCategory::kResolveDump);
           if (!DumpRenderTargets(dump_base, dump_row_length_used, dump_rows,
-                                 dump_pitch, copy_native)) {
+                                 dump_pitch, copy_native,
+                                 IsResolveDumpingDepthCenter(resolve_info))) {
             REXGPU_ERROR("D3D12RenderTargetCache: Failed to dump host render targets for resolve");
             log_embedded_resolve_failure("dump_render_targets");
             return false;
@@ -3434,6 +3511,12 @@ RenderTargetCache::RenderTarget* D3D12RenderTargetCache::CreateRenderTarget(Rend
   resource_desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
   resource_desc.Flags = key.is_depth ? D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL
                                      : D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+  // Simultaneous access is not allowed with MSAA or depth.
+  const bool uncompressed = !key.is_depth && resource_desc.SampleDesc.Count == 1 &&
+                            REXCVAR_GET(d3d12_render_target_uncompressed);
+  if (uncompressed) {
+    resource_desc.Flags |= D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS;
+  }
   // The first access will be ownership transfer into this render target or
   // starting to draw directly.
   D3D12_RESOURCE_STATES resource_state =
@@ -3460,7 +3543,20 @@ RenderTargetCache::RenderTarget* D3D12RenderTargetCache::CreateRenderTarget(Rend
   if (FAILED(device->CreateCommittedResource(&ui::d3d12::util::kHeapPropertiesDefault,
                                              D3D12_HEAP_FLAG_NONE, &resource_desc, resource_state,
                                              &optimized_clear_value, IID_PPV_ARGS(&resource)))) {
-    return nullptr;
+    if (!uncompressed) {
+      return nullptr;
+    }
+    // The diagnostic flag was refused: create the render target normally.
+    std::fprintf(stderr, "REX_GPU_TEST_SWITCHES uncompressed_render_target_refused key=%08X\n",
+                 key.key);
+    std::fflush(stderr);
+    resource_desc.Flags &= ~D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS;
+    if (FAILED(device->CreateCommittedResource(&ui::d3d12::util::kHeapPropertiesDefault,
+                                               D3D12_HEAP_FLAG_NONE, &resource_desc,
+                                               resource_state, &optimized_clear_value,
+                                               IID_PPV_ARGS(&resource)))) {
+      return nullptr;
+    }
   }
   {
     std::u16string resource_name = rex::string::to_utf16(key.GetDebugName());
@@ -6194,7 +6290,64 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
       // bits that need to be 1 by discarding samples. Clearing everything here
       // to reduce context switches internally in the driver if clear causes
       // them.
-      if (stencil_clear_rectangle_count) {
+      ID3D12PipelineState* stencil_clear_pipeline =
+          stencil_clear_rectangle_count
+              ? transfer_stencil_clear_pipelines_
+                    [size_t(dest_rt_key.GetDepthFormat() ==
+                            xenos::DepthRenderTargetFormat::kD24FS8)]
+                    [size_t(dest_rt_key.msaa_samples)]
+              : nullptr;
+      if (stencil_clear_pipeline) {
+        // d3d12_transfer_stencil_clear_by_draw: the same rectangles, each a
+        // viewport and scissor for one full-viewport triangle.
+        D3D12CommandProcessor::GpuTimingScope stencil_clear_timing(
+            command_processor_, GpuTimingCategory::kTransferStencil);
+        command_processor_.SetExternalGraphicsRootSignature(uint32_rtv_clear_root_signature_);
+        command_processor_.SetExternalPipeline(stencil_clear_pipeline);
+        command_processor_.SetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        command_processor_.SetStencilReference(0);
+        command_processor_.SubmitBarriers();
+        for (const Transfer& transfer : current_transfers) {
+          Transfer::Rectangle transfer_stencil_clear_rectangles[Transfer::kMaxRectanglesWithCutout];
+          uint32_t transfer_stencil_clear_rectangle_count = transfer.GetRectangles(
+              dest_rt_key.base_tiles, dest_pitch_tiles, dest_rt_key.msaa_samples, dest_is_64bpp,
+              transfer_stencil_clear_rectangles, resolve_clear_rectangle);
+          for (uint32_t j = 0; j < transfer_stencil_clear_rectangle_count; ++j) {
+            const Transfer::Rectangle& stencil_clear_rectangle =
+                transfer_stencil_clear_rectangles[j];
+            D3D12_RECT stencil_clear_rect;
+            stencil_clear_rect.left =
+                LONG(stencil_clear_rectangle.x_pixels * GetKeyScaleX(dest_rt_key));
+            stencil_clear_rect.top =
+                LONG(stencil_clear_rectangle.y_pixels * GetKeyScaleY(dest_rt_key));
+            stencil_clear_rect.right =
+                LONG((stencil_clear_rectangle.x_pixels + stencil_clear_rectangle.width_pixels) *
+                     GetKeyScaleX(dest_rt_key));
+            stencil_clear_rect.bottom =
+                LONG((stencil_clear_rectangle.y_pixels + stencil_clear_rectangle.height_pixels) *
+                     GetKeyScaleY(dest_rt_key));
+            if (stencil_clear_rect.right <= stencil_clear_rect.left ||
+                stencil_clear_rect.bottom <= stencil_clear_rect.top) {
+              continue;
+            }
+            D3D12_VIEWPORT stencil_clear_viewport;
+            stencil_clear_viewport.TopLeftX = float(stencil_clear_rect.left);
+            stencil_clear_viewport.TopLeftY = float(stencil_clear_rect.top);
+            stencil_clear_viewport.Width = float(stencil_clear_rect.right - stencil_clear_rect.left);
+            stencil_clear_viewport.Height =
+                float(stencil_clear_rect.bottom - stencil_clear_rect.top);
+            stencil_clear_viewport.MinDepth = 0.0f;
+            stencil_clear_viewport.MaxDepth = 1.0f;
+            command_processor_.SetViewport(stencil_clear_viewport);
+            command_processor_.SetScissorRect(stencil_clear_rect);
+            command_list.D3DDrawInstanced(3, 1, 0, 0);
+          }
+        }
+        // The stencil bit draws use the reference 0xFF; the transfer viewport
+        // and scissor are set again below.
+        command_processor_.SetStencilReference(UINT8_MAX);
+        transfer_viewport_set = false;
+      } else if (stencil_clear_rectangle_count) {
         D3D12CommandProcessor::GpuTimingScope stencil_clear_timing(
             command_processor_, GpuTimingCategory::kTransferStencil);
         command_processor_.SubmitBarriers();
@@ -7184,9 +7337,12 @@ ID3D12PipelineState* D3D12RenderTargetCache::GetOrCreateDumpPipeline(DumpPipelin
                                   dxbc::ResourceReturnTypeX4Token(dxbc::ResourceReturnType::kUInt),
                                   dxbc::Src::U(dxbc::Src::Dcl, 0, 0, 0));
   a.OpDclInput(dxbc::Dest::VThreadID(0b0011));
+  bool depth_center =
+      key.depth_center && key.is_depth && key.msaa_samples == xenos::MsaaSamples::k2X;
   // r0 - addressing before the load, then addressing and conversion scratch
   // r1 - addressing scratch before the load, then data
-  stat.temp_register_count = 2;
+  // r2, r3 - pixel-centre depth when depth_center
+  stat.temp_register_count = depth_center ? 4 : 2;
   a.OpDclTemps(stat.temp_register_count);
   // There's no strict dependency on the group size here, for simplicity of
   // calculations especially with resolution scaling, dividing manually (as the
@@ -7479,6 +7635,83 @@ ID3D12PipelineState* D3D12RenderTargetCache::GetOrCreateDumpPipeline(DumpPipelin
       a.OpLdMS(dxbc::Dest::R(1, 0b0010), source_address_src, 0b0011,
                dxbc::Src::T(1, 1), dxbc::Src::R(0, dxbc::Src::kWWWW));
     }
+    if (depth_center) {
+      // Replace the depth of the sample with the depth at the pixel centre -
+      // the mean of the top and the bottom samples, diagonal on the host - if
+      // the pixel lies on one surface with its neighbours: the samples may
+      // differ by at most what the one-sided depth gradients towards the
+      // flatter neighbours allow. They are half of the X and Y gradients apart
+      // with native 2x at (-4, -4) and (4, 4) sixteenths, a quarter of X and
+      // three quarters of Y with 2x as 4x samples 0 and 3; the limits add a
+      // margin for curved meshes. Silhouette pixels keep the depth of their
+      // own sample, as the mean of two surfaces is a point on neither.
+      // Neighbours outside the texture load zeros and only fail the test.
+      dxbc::Src depth_src(dxbc::Src::T(0, 0, dxbc::Src::kXXXX));
+      dxbc::Src sample_top_src(
+          dxbc::Src::LU(draw_util::GetD3D10SampleIndexForGuest2xMSAA(0, msaa_2x_supported_)));
+      dxbc::Src sample_bottom_src(
+          dxbc::Src::LU(draw_util::GetD3D10SampleIndexForGuest2xMSAA(1, msaa_2x_supported_)));
+      // r0.xy = pixel position
+      // r0.z = sample offset in the EDRAM
+      // r1.x = source depth value
+      // r1.y = source stencil value
+      // r2.x = top sample depth
+      // r2.y = bottom sample depth
+      a.OpLdMS(dxbc::Dest::R(2, 0b0001), source_address_src, 0b0011, depth_src, sample_top_src);
+      a.OpLdMS(dxbc::Dest::R(2, 0b0010), source_address_src, 0b0011, depth_src,
+               sample_bottom_src);
+      // r3.xy = left neighbour position
+      // r3.zw = right neighbour position
+      a.OpIAdd(dxbc::Dest::R(3), dxbc::Src::R(0, 0b01000100), dxbc::Src::LI(-1, 0, 1, 0));
+      // r2.z = left neighbour top sample depth
+      // r2.w = right neighbour top sample depth
+      a.OpLdMS(dxbc::Dest::R(2, 0b0100), dxbc::Src::R(3, 0b01000100), 0b0011, depth_src,
+               sample_top_src);
+      a.OpLdMS(dxbc::Dest::R(2, 0b1000), dxbc::Src::R(3, 0b11101110), 0b0011, depth_src,
+               sample_top_src);
+      // r3.x = smaller one-sided X gradient
+      a.OpAdd(dxbc::Dest::R(3, 0b0001), dxbc::Src::R(2, dxbc::Src::kXXXX),
+              -dxbc::Src::R(2, dxbc::Src::kZZZZ));
+      a.OpAdd(dxbc::Dest::R(3, 0b0010), dxbc::Src::R(2, dxbc::Src::kWWWW),
+              -dxbc::Src::R(2, dxbc::Src::kXXXX));
+      a.OpMin(dxbc::Dest::R(3, 0b0001), dxbc::Src::R(3, dxbc::Src::kXXXX).Abs(),
+              dxbc::Src::R(3, dxbc::Src::kYYYY).Abs());
+      // r3.zw = upper neighbour position
+      a.OpIAdd(dxbc::Dest::R(3, 0b1100), dxbc::Src::R(0, 0b01000000), dxbc::Src::LI(0, 0, 0, -1));
+      // r2.z = upper neighbour top sample depth
+      a.OpLdMS(dxbc::Dest::R(2, 0b0100), dxbc::Src::R(3, 0b11101110), 0b0011, depth_src,
+               sample_top_src);
+      // r3.zw = lower neighbour position
+      a.OpIAdd(dxbc::Dest::R(3, 0b1100), dxbc::Src::R(0, 0b01000000), dxbc::Src::LI(0, 0, 0, 1));
+      // r2.w = lower neighbour top sample depth
+      a.OpLdMS(dxbc::Dest::R(2, 0b1000), dxbc::Src::R(3, 0b11101110), 0b0011, depth_src,
+               sample_top_src);
+      // r3.y = smaller one-sided Y gradient
+      a.OpAdd(dxbc::Dest::R(3, 0b0100), dxbc::Src::R(2, dxbc::Src::kXXXX),
+              -dxbc::Src::R(2, dxbc::Src::kZZZZ));
+      a.OpAdd(dxbc::Dest::R(3, 0b1000), dxbc::Src::R(2, dxbc::Src::kWWWW),
+              -dxbc::Src::R(2, dxbc::Src::kXXXX));
+      a.OpMin(dxbc::Dest::R(3, 0b0010), dxbc::Src::R(3, dxbc::Src::kZZZZ).Abs(),
+              dxbc::Src::R(3, dxbc::Src::kWWWW).Abs());
+      // r3.x = the largest difference between the samples on one surface
+      a.OpAdd(dxbc::Dest::R(3, 0b0001), dxbc::Src::R(3, dxbc::Src::kXXXX),
+              dxbc::Src::R(3, dxbc::Src::kYYYY));
+      a.OpMul(dxbc::Dest::R(3, 0b0001), dxbc::Src::R(3, dxbc::Src::kXXXX),
+              dxbc::Src::LF(msaa_2x_supported_ ? 0.625f : 0.875f));
+      // r3.y = difference between the samples
+      a.OpAdd(dxbc::Dest::R(3, 0b0010), dxbc::Src::R(2, dxbc::Src::kYYYY),
+              -dxbc::Src::R(2, dxbc::Src::kXXXX));
+      // r3.x = whether the pixel lies on one surface
+      a.OpGE(dxbc::Dest::R(3, 0b0001), dxbc::Src::R(3, dxbc::Src::kXXXX),
+             dxbc::Src::R(3, dxbc::Src::kYYYY).Abs());
+      // r2.z = depth at the pixel centre
+      a.OpAdd(dxbc::Dest::R(2, 0b0100), dxbc::Src::R(2, dxbc::Src::kXXXX),
+              dxbc::Src::R(2, dxbc::Src::kYYYY));
+      a.OpMul(dxbc::Dest::R(2, 0b0100), dxbc::Src::R(2, dxbc::Src::kZZZZ), dxbc::Src::LF(0.5f));
+      // r1.x = depth to store
+      a.OpMovC(dxbc::Dest::R(1, 0b0001), dxbc::Src::R(3, dxbc::Src::kXXXX),
+               dxbc::Src::R(2, dxbc::Src::kZZZZ), dxbc::Src::R(1, dxbc::Src::kXXXX));
+    }
   } else {
     if (key.source_scale_native && !key.native_layout &&
         IsDrawResolutionScaled()) {
@@ -7684,7 +7917,8 @@ ID3D12PipelineState* D3D12RenderTargetCache::GetOrCreateDumpPipeline(DumpPipelin
                                 : xenos::GetColorRenderTargetFormatName(key.GetColorFormat());
   if (pipeline) {
     std::u16string pipeline_name = rex::string::to_utf16(
-        fmt::format("RT Dump {} {}xMSAA", format_name, uint32_t(1) << uint32_t(key.msaa_samples)));
+        fmt::format("RT Dump {} {}xMSAA{}", format_name, uint32_t(1) << uint32_t(key.msaa_samples),
+                    depth_center ? " Centre" : ""));
     pipeline->SetName(reinterpret_cast<LPCWSTR>(pipeline_name.c_str()));
   } else {
     REXGPU_ERROR(
@@ -7736,6 +7970,7 @@ bool D3D12RenderTargetCache::TryResolveCopyDirectly(const draw_util::ResolveInfo
   if (direct_resolve_dispatches_.empty()) {
     return false;
   }
+  const bool depth_center = IsResolveDumpingDepthCenter(resolve_info);
 
   for (const ResolveCopyDumpRectangle& rectangle : dump_rectangles_) {
     const auto* render_target = static_cast<const D3D12RenderTarget*>(rectangle.render_target);
@@ -7749,6 +7984,9 @@ bool D3D12RenderTargetCache::TryResolveCopyDirectly(const draw_util::ResolveInfo
     dump_pipeline_key.source_scale_native =
         render_target->key().scale_native;
     dump_pipeline_key.native_layout = 0;
+    dump_pipeline_key.depth_center =
+        uint32_t(depth_center && render_target->key().is_depth &&
+                 render_target->key().msaa_samples == xenos::MsaaSamples::k2X);
     if (!GetOrCreateDumpPipeline(dump_pipeline_key)) {
       return false;
     }
@@ -7763,13 +8001,14 @@ bool D3D12RenderTargetCache::TryResolveCopyDirectly(const draw_util::ResolveInfo
 
   // Dedicated direct resolve dispatches are staged behind the same preflight;
   // keep using the existing dump path until source-image direct shaders land.
-  return DumpRenderTargets(dump_base, dump_row_length_used, dump_rows, dump_pitch);
+  return DumpRenderTargets(dump_base, dump_row_length_used, dump_rows, dump_pitch, false,
+                           depth_center);
 }
 
 bool D3D12RenderTargetCache::DumpRenderTargets(uint32_t dump_base, uint32_t dump_row_length_used,
                                                uint32_t dump_rows,
                                                uint32_t dump_pitch,
-                                               bool native_layout) {
+                                               bool native_layout, bool depth_center) {
   assert_true(GetPath() == Path::kHostRenderTargets);
 
   GetResolveCopyRectanglesToDump(dump_base, dump_row_length_used, dump_rows, dump_pitch,
@@ -7820,6 +8059,8 @@ bool D3D12RenderTargetCache::DumpRenderTargets(uint32_t dump_base, uint32_t dump
     pipeline_key.is_depth = rt_key.is_depth;
     pipeline_key.source_scale_native = rt_key.scale_native;
     pipeline_key.native_layout = uint32_t(native_layout);
+    pipeline_key.depth_center = uint32_t(depth_center && rt_key.is_depth &&
+                                         rt_key.msaa_samples == xenos::MsaaSamples::k2X);
     dump_invocations_.emplace_back(rectangle, pipeline_key);
   }
   // 32bpp and 64bpp.

@@ -53,6 +53,7 @@
 #include <rex/memory/utils.h>
 #include <rex/ui/d3d12/d3d12_presenter.h>
 #include <rex/ui/d3d12/d3d12_util.h>
+#include <rex/ui/frame_latency.h>
 
 REXCVAR_DEFINE_BOOL(d3d12_bindless, true, "GPU/D3D12", "Use bindless resources where available")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
@@ -80,6 +81,14 @@ REXCVAR_DEFINE_UINT32(d3d12_submit_after_draws, 0, "GPU/D3D12",
 REXCVAR_DEFINE_BOOL(d3d12_async_submission, true, "GPU/D3D12",
                     "Replay and execute closed submissions on a worker thread")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+// Players' slower GPUs finish each frame later relative to the CPU than a fast
+// test GPU does (#16/#20 reproduce only there); a serial compute chain at
+// every frame start shifts the GPU timeline the same way. Nothing else changes.
+REXCVAR_DEFINE_UINT32(d3d12_debug_gpu_spin, 0, "GPU/D3D12",
+                      "Diagnostics: at every frame start, a compute dispatch runs this many "
+                      "thousand dependent steps (with a full barrier after it) to emulate a "
+                      "slower GPU; 0 = off, maximum 20000")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_BOOL(d3d12_deferred_presenter_completion, true, "GPU/D3D12",
                     "With asynchronous submission, run the presenter's post-refresh steps "
                     "(fence signal, mailbox publication, immediate paint) on the submission "
@@ -1203,10 +1212,11 @@ void EmbeddedFrameDumpAtSwap(uint64_t frame, uint32_t scale_x, uint32_t scale_y)
     return;
   }
   std::fprintf(embedded_frame_dump_file,
-               "FRAME_DUMP version=1 after_frame=%llu draw_scale=%ux%u\n"
+               "FRAME_DUMP version=2 after_frame=%llu draw_scale=%ux%u\n"
                "# D <draw> bins=select/mask vs ps prim verts surf c0..c3 depth mask colorctl "
                "blend0..3 depthctl stencil stencil_bf modectl sumode woffset scissor_tl "
-               "scissor_br t<fetch>=6 dwords\n"
+               "scissor_br po=front_scale,front_offset,back_scale,back_offset clip "
+               "t<fetch>=6 dwords\n"
                "# P = a packet the predicated-tiling bin check skipped\n"
                "# C <copy> copyctl dest_base dest_pitch dest_info surf c0 depth woffset\n",
                static_cast<unsigned long long>(frame), scale_x, scale_y);
@@ -1221,7 +1231,8 @@ void EmbeddedFrameDumpDraw(const RegisterFile& regs, const DxbcShader& vertex_sh
       "D %u bins=%llX/%llX vs=%016llX ps=%016llX prim=%u verts=%u surf=%08X "
       "c=%08X,%08X,%08X,%08X "
       "depth=%08X mask=%08X colorctl=%08X blend=%08X,%08X,%08X,%08X depthctl=%08X "
-      "stencil=%08X,%08X modectl=%08X sumode=%08X woff=%08X sc=%08X,%08X",
+      "stencil=%08X,%08X modectl=%08X sumode=%08X woff=%08X sc=%08X,%08X "
+      "po=%08X,%08X,%08X,%08X clip=%08X",
       embedded_frame_dump_draws++, static_cast<unsigned long long>(bin_select),
       static_cast<unsigned long long>(bin_mask),
       static_cast<unsigned long long>(vertex_shader.ucode_data_hash()),
@@ -1235,7 +1246,10 @@ void EmbeddedFrameDumpDraw(const RegisterFile& regs, const DxbcShader& vertex_sh
       regs[XE_GPU_REG_RB_DEPTHCONTROL], regs[XE_GPU_REG_RB_STENCILREFMASK],
       regs[XE_GPU_REG_RB_STENCILREFMASK_BF], regs[XE_GPU_REG_RB_MODECONTROL],
       regs[XE_GPU_REG_PA_SU_SC_MODE_CNTL], regs[XE_GPU_REG_PA_SC_WINDOW_OFFSET],
-      regs[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_TL], regs[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_BR]);
+      regs[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_TL], regs[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_BR],
+      regs[XE_GPU_REG_PA_SU_POLY_OFFSET_FRONT_SCALE], regs[XE_GPU_REG_PA_SU_POLY_OFFSET_FRONT_OFFSET],
+      regs[XE_GPU_REG_PA_SU_POLY_OFFSET_BACK_SCALE], regs[XE_GPU_REG_PA_SU_POLY_OFFSET_BACK_OFFSET],
+      regs[XE_GPU_REG_PA_CL_CLIP_CNTL]);
   uint32_t seen = 0;
   auto bindings = [&](const DxbcShader& shader) {
     for (const auto& binding : shader.GetTextureBindingsAfterTranslation()) {
@@ -1683,6 +1697,8 @@ namespace shaders {
 #include "../shaders/bytecode/d3d12_5_1/apply_gamma_pwl_fxaa_luma_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/apply_gamma_table_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/apply_gamma_table_fxaa_luma_cs.h"
+// scripts/build-debug-shaders.ps1 (FXC) from shaders/debug_gpu_spin.cs.hlsl.
+#include "../shaders/bytecode/d3d12_5_1/debug_gpu_spin_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/fxaa_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/fxaa_extreme_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/resolve_downscale_cs.h"
@@ -3168,6 +3184,20 @@ bool D3D12CommandProcessor::SetupContext() {
     std::fprintf(stderr, "REX_DRAW_BATCH_CONFIG limit=%u query_splits=0\n",
                  guest_draw_submit_limit_);
   }
+  // Test switches for artifacts seen only on some GPU generations (#16, #20),
+  // so a player's session log shows which test was active.
+  std::fprintf(stderr,
+               "REX_GPU_TEST_SWITCHES conservative_sync=%u async_submission=%u "
+               "native_grid_rules=%u depth_pixel_center=%u uncompressed_render_targets=%u "
+               "native_2x_msaa=%u transfer_stencil_clear_by_draw=%u "
+               "depth_transfer_not_equal=%u\n",
+               REXCVAR_GET(d3d12_conservative_sync) ? 1u : 0u, async_submission_ ? 1u : 0u,
+               REXCVAR_GET(draw_resolution_scale_native_grid_rules).empty() ? 0u : 1u,
+               REXCVAR_GET(resolve_depth_pixel_center) ? 1u : 0u,
+               REXCVAR_GET(d3d12_render_target_uncompressed) ? 1u : 0u,
+               REXCVAR_GET(native_2x_msaa) ? 1u : 0u,
+               REXCVAR_GET(d3d12_transfer_stencil_clear_by_draw) ? 1u : 0u,
+               REXCVAR_GET(depth_transfer_not_equal_test) ? 1u : 0u);
   if (!render_target::native_shader_scale_policy::Parse(
           REXCVAR_GET(draw_resolution_scale_native_grid_rules), native_shader_grid_rules_)) {
     REXGPU_ERROR("Invalid native shader-grid policy; refusing ambiguous scale annotations");
@@ -3914,6 +3944,45 @@ bool D3D12CommandProcessor::SetupContext() {
     REXGPU_WARN("Failed to initialize D3D12 resolve-downscale readback pipeline");
   }
 
+  debug_gpu_spin_steps_ = std::min(REXCVAR_GET(d3d12_debug_gpu_spin), uint32_t(20000)) * 1000;
+  if (debug_gpu_spin_steps_) {
+    D3D12_ROOT_PARAMETER spin_root_parameters[2];
+    spin_root_parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    spin_root_parameters[0].Constants.ShaderRegister = 0;
+    spin_root_parameters[0].Constants.RegisterSpace = 0;
+    spin_root_parameters[0].Constants.Num32BitValues = 1;
+    spin_root_parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    spin_root_parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    spin_root_parameters[1].Descriptor.ShaderRegister = 0;
+    spin_root_parameters[1].Descriptor.RegisterSpace = 0;
+    spin_root_parameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    D3D12_ROOT_SIGNATURE_DESC spin_root_signature_desc = {};
+    spin_root_signature_desc.NumParameters = UINT(rex::countof(spin_root_parameters));
+    spin_root_signature_desc.pParameters = spin_root_parameters;
+    *(debug_gpu_spin_root_signature_.ReleaseAndGetAddressOf()) =
+        ui::d3d12::util::CreateRootSignature(provider, spin_root_signature_desc);
+    if (debug_gpu_spin_root_signature_) {
+      *(debug_gpu_spin_pipeline_.ReleaseAndGetAddressOf()) =
+          ui::d3d12::util::CreateComputePipeline(device, shaders::debug_gpu_spin_cs,
+                                                 sizeof(shaders::debug_gpu_spin_cs),
+                                                 debug_gpu_spin_root_signature_.Get());
+    }
+    D3D12_RESOURCE_DESC spin_buffer_desc;
+    ui::d3d12::util::FillBufferResourceDesc(spin_buffer_desc, 256,
+                                            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    if (FAILED(device->CreateCommittedResource(
+            &ui::d3d12::util::kHeapPropertiesDefault, provider.GetHeapFlagCreateNotZeroed(),
+            &spin_buffer_desc, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+            IID_PPV_ARGS(debug_gpu_spin_buffer_.ReleaseAndGetAddressOf())))) {
+      debug_gpu_spin_buffer_.Reset();
+    }
+    if (!debug_gpu_spin_pipeline_ || !debug_gpu_spin_buffer_) {
+      debug_gpu_spin_steps_ = 0;
+    }
+    std::fprintf(stderr, "REX_GPU_TEST_SWITCHES debug_gpu_spin_steps=%u\n",
+                 debug_gpu_spin_steps_);
+  }
+
   if (bindless_resources_used_) {
     // Create the system bindless descriptors once all resources are
     // initialized.
@@ -4153,6 +4222,10 @@ void D3D12CommandProcessor::ShutdownContext() {
   fxaa_root_signature_.Reset();
   resolve_downscale_pipeline_.Reset();
   resolve_downscale_root_signature_.Reset();
+  debug_gpu_spin_buffer_.Reset();
+  debug_gpu_spin_pipeline_.Reset();
+  debug_gpu_spin_root_signature_.Reset();
+  debug_gpu_spin_steps_ = 0;
 
   apply_gamma_pwl_fxaa_luma_pipeline_.Reset();
   apply_gamma_pwl_pipeline_.Reset();
@@ -4551,6 +4624,12 @@ bool D3D12CommandProcessor::EnsureSmaaResources(uint32_t width, uint32_t height)
 void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                       uint32_t frontbuffer_height) {
   SCOPE_profile_cpu_f("gpu");
+  // Frame tracking (no-ops unless low latency or NVIDIA Streamline uses it):
+  // this swap's guest frame, ended after its final submission or on return.
+  ui::frame_latency::BeginRenderSubmit();
+  struct RenderSubmitEnd {
+    ~RenderSubmitEnd() { ui::frame_latency::EndRenderSubmit(); }
+  } render_submit_end;
   const bool record_embedded_timing =
       kGpuDiagnostics && !kernel_state_ && REXCVAR_GET(embedded_hitch_diagnostics);
   const auto issue_swap_start =
@@ -5317,6 +5396,7 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
         // queue.
         SubmitBarriers();
         EndSubmission(true);
+        ui::frame_latency::EndRenderSubmit();
         // The presenter signals its own fence on the queue after this; the
         // frame's commands must already be in the queue before it. When the
         // presenter's completion is deferred it runs as a worker task queued
@@ -10232,6 +10312,21 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
     primitive_processor_->BeginFrame();
 
     texture_cache_->BeginFrame();
+
+    if (debug_gpu_spin_steps_) {
+      // d3d12_debug_gpu_spin: the frame's work starts after the chain ends.
+      SubmitBarriers();
+      SetExternalPipeline(debug_gpu_spin_pipeline_.Get());
+      deferred_command_list_.D3DSetComputeRootSignature(debug_gpu_spin_root_signature_.Get());
+      deferred_command_list_.D3DSetComputeRoot32BitConstants(0, 1, &debug_gpu_spin_steps_, 0);
+      deferred_command_list_.D3DSetComputeRootUnorderedAccessView(
+          1, debug_gpu_spin_buffer_->GetGPUVirtualAddress());
+      deferred_command_list_.D3DDispatch(1, 1, 1);
+      D3D12_RESOURCE_BARRIER spin_barrier = {};
+      spin_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+      spin_barrier.UAV.pResource = nullptr;
+      deferred_command_list_.D3DResourceBarrier(1, &spin_barrier);
+    }
   }
 
 #if REX_GPU_DIAGNOSTICS
@@ -10865,11 +10960,36 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
   }
 
   // Conversion to Direct3D 12 normalized device coordinates.
+  float ndc_offset[3] = {viewport_info.ndc_offset[0], viewport_info.ndc_offset[1],
+                         viewport_info.ndc_offset[2]};
+  // The Xenos (like Direct3D 9) adds the constant polygon offset to the depth
+  // as an absolute value, while a Direct3D 12 depth bias with a float32 depth
+  // buffer is in units of the primitive's own exponent, so the converted bias
+  // (exact only for depths in [0.5, 1)) is many times smaller at small depths
+  // - reversed-depth shadow maps then self-shadow (light-facing triangles,
+  // #6). With host render targets, the guest's window depth maps to the host
+  // depth linearly (halved for float24 kept in 0...1), so the absolute offset
+  // is an exact shift of the NDC Z; the pipeline's constant bias is 0 then
+  // (the slope term stays a Direct3D 12 slope-scaled bias).
+  if (!edram_rov_used && REXCVAR_GET(d3d12_absolute_polygon_offset)) {
+    float polygon_offset_scale = 0.0f, polygon_offset = 0.0f;
+    draw_util::GetPreferredFacePolygonOffset(regs, primitive_polygonal, polygon_offset_scale,
+                                             polygon_offset);
+    float host_depth_range = viewport_info.z_max - viewport_info.z_min;
+    if (polygon_offset != 0.0f && host_depth_range != 0.0f) {
+      float host_depth_per_guest_depth =
+          (normalized_depth_control.z_enable &&
+           rb_depth_info.depth_format == xenos::DepthRenderTargetFormat::kD24FS8)
+              ? 0.5f
+              : 1.0f;
+      ndc_offset[2] += polygon_offset * host_depth_per_guest_depth / host_depth_range;
+    }
+  }
   for (uint32_t i = 0; i < 3; ++i) {
     dirty |= system_constants_.ndc_scale[i] != viewport_info.ndc_scale[i];
-    dirty |= system_constants_.ndc_offset[i] != viewport_info.ndc_offset[i];
+    dirty |= system_constants_.ndc_offset[i] != ndc_offset[i];
     system_constants_.ndc_scale[i] = viewport_info.ndc_scale[i];
-    system_constants_.ndc_offset[i] = viewport_info.ndc_offset[i];
+    system_constants_.ndc_offset[i] = ndc_offset[i];
   }
 
   // Point size.

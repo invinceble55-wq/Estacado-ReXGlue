@@ -9,7 +9,10 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <cstdio>
 #include <cstdlib>
+#include <mutex>
+#include <unordered_map>
 
 #include <rex/cvar.h>
 #include <rex/logging.h>
@@ -17,11 +20,16 @@
 #include <rex/ui/d3d12/d3d12_immediate_drawer.h>
 #include <rex/ui/d3d12/d3d12_presenter.h>
 #include <rex/ui/d3d12/d3d12_provider.h>
+#include <rex/ui/d3d12/streamline_bridge.h>
 
 #include <dxgi1_6.h>
 #include <malloc.h>
 
 REXCVAR_DEFINE_BOOL(d3d12_debug, false, "UI/D3D12", "Enable Direct3D 12 and DXGI debug layer")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+REXCVAR_DEFINE_BOOL(d3d12_debug_gpu_validation, false, "UI/D3D12",
+                    "With d3d12_debug, also enable GPU-based validation (very slow)")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 REXCVAR_DEFINE_BOOL(d3d12_break_on_error, false, "UI/D3D12",
@@ -39,6 +47,30 @@ REXCVAR_DEFINE_INT32(d3d12_queue_priority, 1, "UI/D3D12",
     .range(0, 2);
 
 namespace rex::ui::d3d12 {
+
+namespace {
+
+// With d3d12_debug, debug layer messages go to stderr (REX_D3D12_DEBUG): the
+// first occurrences of each message ID in full, then at powers of two.
+std::mutex debug_message_mutex;
+std::unordered_map<int, uint32_t> debug_message_counts;
+
+void CALLBACK LogDebugMessage(D3D12_MESSAGE_CATEGORY category, D3D12_MESSAGE_SEVERITY severity,
+                              D3D12_MESSAGE_ID id, LPCSTR description, void* context) {
+  uint32_t count;
+  {
+    std::lock_guard<std::mutex> lock(debug_message_mutex);
+    count = ++debug_message_counts[int(id)];
+  }
+  if (count > 8 && (count & (count - 1))) {
+    return;
+  }
+  std::fprintf(stderr, "REX_D3D12_DEBUG severity=%d category=%d id=%d count=%u %s\n",
+               int(severity), int(category), int(id), count, description ? description : "");
+  std::fflush(stderr);
+}
+
+}  // namespace
 
 bool D3D12Provider::IsD3D12APIAvailable() {
   HMODULE library_d3d12 = LoadLibraryW(L"D3D12.dll");
@@ -69,6 +101,8 @@ D3D12Provider::~D3D12Provider() {
   if (graphics_analysis_ != nullptr) {
     graphics_analysis_->Release();
   }
+  // Streamline's proxies and slShutdown go before the native objects.
+  streamline::Shutdown();
   if (direct_queue_ != nullptr) {
     direct_queue_->Release();
   }
@@ -101,6 +135,16 @@ D3D12Provider::~D3D12Provider() {
   if (library_dxgi_ != nullptr) {
     FreeLibrary(library_dxgi_);
   }
+}
+
+IDXGIFactory2* D3D12Provider::GetSwapChainFactory() const {
+  IDXGIFactory2* proxy = streamline::SwapChainFactory();
+  return proxy ? proxy : dxgi_factory_;
+}
+
+ID3D12CommandQueue* D3D12Provider::GetSwapChainQueue() const {
+  ID3D12CommandQueue* proxy = streamline::SwapChainQueue();
+  return proxy ? proxy : direct_queue_;
 }
 
 bool D3D12Provider::EnableIncreaseBasePriorityPrivilege() {
@@ -223,6 +267,14 @@ bool D3D12Provider::Initialize() {
     ID3D12Debug* debug_interface;
     if (SUCCEEDED(pfn_d3d12_get_debug_interface_(IID_PPV_ARGS(&debug_interface)))) {
       debug_interface->EnableDebugLayer();
+      if (REXCVAR_GET(d3d12_debug_gpu_validation)) {
+        ID3D12Debug1* debug_interface1;
+        if (SUCCEEDED(debug_interface->QueryInterface(IID_PPV_ARGS(&debug_interface1)))) {
+          debug_interface1->SetEnableGPUBasedValidation(TRUE);
+          debug_interface1->Release();
+          std::fprintf(stderr, "REX_D3D12_DEBUG_GPU_VALIDATION enabled=1\n");
+        }
+      }
       debug_interface->Release();
     } else {
       REXLOG_WARN("Failed to enable the Direct3D 12 debug layer");
@@ -243,6 +295,10 @@ bool D3D12Provider::Initialize() {
       }
     }
   }
+  // Optional NVIDIA Streamline (Reflex), initialized before any DXGI or
+  // Direct3D 12 object exists as it requires.
+  streamline::InitializeBeforeDevice();
+
   // Create the DXGI factory.
   IDXGIFactory2* dxgi_factory;
   if (FAILED(pfn_create_dxgi_factory2_(debug ? DXGI_CREATE_FACTORY_DEBUG : 0,
@@ -323,6 +379,21 @@ bool D3D12Provider::Initialize() {
                             adapter_name_mb_size, nullptr, nullptr) != 0) {
       REXGPU_INFO("DXGI adapter: {} (vendor 0x{:04X}, device 0x{:04X})", adapter_name_mb,
                   adapter_desc.VendorId, adapter_desc.DeviceId);
+      // Also on stderr, so session logs and test runs name the GPU and its
+      // driver (user-mode driver version) for reports.
+      LARGE_INTEGER driver_version = {};
+      const bool driver_known =
+          SUCCEEDED(adapter->CheckInterfaceSupport(__uuidof(IDXGIDevice), &driver_version));
+      std::fprintf(stderr,
+                   "REX_GPU_ADAPTER name=\"%s\" vendor=0x%04X device=0x%04X driver=%u.%u.%u.%u "
+                   "dedicated_mb=%llu\n",
+                   adapter_name_mb, adapter_desc.VendorId, adapter_desc.DeviceId,
+                   driver_known ? uint32_t(HIWORD(driver_version.HighPart)) : 0u,
+                   driver_known ? uint32_t(LOWORD(driver_version.HighPart)) : 0u,
+                   driver_known ? uint32_t(HIWORD(driver_version.LowPart)) : 0u,
+                   driver_known ? uint32_t(LOWORD(driver_version.LowPart)) : 0u,
+                   static_cast<unsigned long long>(adapter_desc.DedicatedVideoMemory >> 20));
+      std::fflush(stderr);
     }
   }
 
@@ -335,6 +406,9 @@ bool D3D12Provider::Initialize() {
     return false;
   }
   adapter->Release();
+  streamline::OnDeviceCreated(device,
+                              (uint64_t(uint32_t(adapter_desc.AdapterLuid.HighPart)) << 32) |
+                                  adapter_desc.AdapterLuid.LowPart);
 
   // Configure the Direct3D 12 debug info queue.
   ID3D12InfoQueue* d3d12_info_queue;
@@ -374,6 +448,14 @@ bool D3D12Provider::Initialize() {
     if (REXCVAR_GET(d3d12_break_on_warning)) {
       d3d12_info_queue->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_WARNING, TRUE);
     }
+    ID3D12InfoQueue1* d3d12_info_queue1;
+    if (SUCCEEDED(d3d12_info_queue->QueryInterface(IID_PPV_ARGS(&d3d12_info_queue1)))) {
+      DWORD cookie = 0;
+      const bool registered = SUCCEEDED(d3d12_info_queue1->RegisterMessageCallback(
+          LogDebugMessage, D3D12_MESSAGE_CALLBACK_FLAG_NONE, nullptr, &cookie));
+      std::fprintf(stderr, "REX_D3D12_DEBUG_LOG registered=%u\n", registered ? 1u : 0u);
+      d3d12_info_queue1->Release();
+    }
     d3d12_info_queue->Release();
   }
 
@@ -397,7 +479,13 @@ bool D3D12Provider::Initialize() {
   queue_desc.Flags = D3D12_COMMAND_QUEUE_FLAG_NONE;
   queue_desc.NodeMask = 0;
   ID3D12CommandQueue* direct_queue;
-  if (FAILED(device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&direct_queue)))) {
+  // With Streamline the queue is created through its device proxy (the swap
+  // chain needs that proxy); every submission uses the native queue.
+  auto create_direct_queue = [&]() {
+    return streamline::CreateDirectQueue(device, queue_desc, &direct_queue) ||
+           SUCCEEDED(device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&direct_queue)));
+  };
+  if (!create_direct_queue()) {
     bool queue_created = false;
     if (queue_desc.Priority == D3D12_COMMAND_QUEUE_PRIORITY_GLOBAL_REALTIME) {
       REXLOG_WARN(
@@ -405,8 +493,7 @@ bool D3D12Provider::Initialize() {
           "realtime priority, falling back to high priority, try launching "
           "Xenia as administrator");
       queue_desc.Priority = D3D12_COMMAND_QUEUE_PRIORITY_HIGH;
-      queue_created =
-          SUCCEEDED(device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&direct_queue)));
+      queue_created = create_direct_queue();
     }
     if (!queue_created) {
       REXLOG_ERROR("Failed to create a Direct3D 12 direct command queue");
@@ -419,6 +506,7 @@ bool D3D12Provider::Initialize() {
   dxgi_factory_ = dxgi_factory;
   device_ = device;
   direct_queue_ = direct_queue;
+  streamline::UpgradeFactory(dxgi_factory);
 
   // Get descriptor sizes for each type.
   for (uint32_t i = 0; i < D3D12_DESCRIPTOR_HEAP_TYPE_NUM_TYPES; ++i) {

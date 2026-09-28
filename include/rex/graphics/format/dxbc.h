@@ -1490,8 +1490,13 @@ class Assembler {
  public:
   Assembler(std::vector<uint32_t>& code, Statistics& stat) : code_(code), stat_(stat) {}
 
+  // Precise float math (D3D11_SB_INSTRUCTION_PRECISE_VALUES, opcode bits
+  // 19-22 for all four components) on the MAD, MUL, ADD and DP2/3/4 emitted
+  // while it is on: drivers then neither fuse multiply-adds nor reassociate.
+  void SetPreciseFloatMath(bool precise) { precise_bits_ = precise ? (UINT32_C(0xF) << 19) : 0; }
+
   void OpAdd(const Dest& dest, const Src& src0, const Src& src1, bool saturate = false) {
-    EmitAluOp(Opcode::kAdd, 0b00, dest, src0, src1, saturate);
+    EmitAluOp(Opcode::kAdd, 0b00, dest, src0, src1, saturate, precise_bits_);
     ++stat_.float_instruction_count;
   }
   void OpAnd(const Dest& dest, const Src& src0, const Src& src1) {
@@ -1531,7 +1536,7 @@ class Assembler {
   void OpDP2(const Dest& dest, const Src& src0, const Src& src1, bool saturate = false) {
     uint32_t operands_length = dest.GetLength() + src0.GetLength(0b0011) + src1.GetLength(0b0011);
     code_.reserve(code_.size() + 1 + operands_length);
-    code_.push_back(OpcodeToken(Opcode::kDP2, operands_length, saturate));
+    code_.push_back(OpcodeToken(Opcode::kDP2, operands_length, saturate) | precise_bits_);
     dest.Write(code_);
     src0.Write(code_, false, 0b0011);
     src1.Write(code_, false, 0b0011);
@@ -1541,7 +1546,7 @@ class Assembler {
   void OpDP3(const Dest& dest, const Src& src0, const Src& src1, bool saturate = false) {
     uint32_t operands_length = dest.GetLength() + src0.GetLength(0b0111) + src1.GetLength(0b0111);
     code_.reserve(code_.size() + 1 + operands_length);
-    code_.push_back(OpcodeToken(Opcode::kDP3, operands_length, saturate));
+    code_.push_back(OpcodeToken(Opcode::kDP3, operands_length, saturate) | precise_bits_);
     dest.Write(code_);
     src0.Write(code_, false, 0b0111);
     src1.Write(code_, false, 0b0111);
@@ -1551,7 +1556,7 @@ class Assembler {
   void OpDP4(const Dest& dest, const Src& src0, const Src& src1, bool saturate = false) {
     uint32_t operands_length = dest.GetLength() + src0.GetLength(0b1111) + src1.GetLength(0b1111);
     code_.reserve(code_.size() + 1 + operands_length);
-    code_.push_back(OpcodeToken(Opcode::kDP4, operands_length, saturate));
+    code_.push_back(OpcodeToken(Opcode::kDP4, operands_length, saturate) | precise_bits_);
     dest.Write(code_);
     src0.Write(code_, false, 0b1111);
     src1.Write(code_, false, 0b1111);
@@ -1712,7 +1717,7 @@ class Assembler {
   }
   void OpMAd(const Dest& dest, const Src& mul0, const Src& mul1, const Src& add,
              bool saturate = false) {
-    EmitAluOp(Opcode::kMAd, 0b000, dest, mul0, mul1, add, saturate);
+    EmitAluOp(Opcode::kMAd, 0b000, dest, mul0, mul1, add, saturate, precise_bits_);
     ++stat_.float_instruction_count;
   }
   void OpMin(const Dest& dest, const Src& src0, const Src& src1, bool saturate = false) {
@@ -1754,7 +1759,7 @@ class Assembler {
     ++stat_.movc_instruction_count;
   }
   void OpMul(const Dest& dest, const Src& src0, const Src& src1, bool saturate = false) {
-    EmitAluOp(Opcode::kMul, 0b00, dest, src0, src1, saturate);
+    EmitAluOp(Opcode::kMul, 0b00, dest, src0, src1, saturate, precise_bits_);
     ++stat_.float_instruction_count;
   }
   void OpNE(const Dest& dest, const Src& src0, const Src& src1) {
@@ -2301,24 +2306,25 @@ class Assembler {
     ++stat_.instruction_count;
   }
   void EmitAluOp(Opcode opcode, uint32_t src_are_integer, const Dest& dest, const Src& src0,
-                 const Src& src1, bool saturate = false) {
+                 const Src& src1, bool saturate = false, uint32_t extra_opcode_bits = 0) {
     uint32_t dest_write_mask = dest.GetMask();
     uint32_t operands_length =
         dest.GetLength() + src0.GetLength(dest_write_mask) + src1.GetLength(dest_write_mask);
     code_.reserve(code_.size() + 1 + operands_length);
-    code_.push_back(OpcodeToken(opcode, operands_length, saturate));
+    code_.push_back(OpcodeToken(opcode, operands_length, saturate) | extra_opcode_bits);
     dest.Write(code_);
     src0.Write(code_, (src_are_integer & 0b1) != 0, dest_write_mask);
     src1.Write(code_, (src_are_integer & 0b10) != 0, dest_write_mask);
     ++stat_.instruction_count;
   }
   void EmitAluOp(Opcode opcode, uint32_t src_are_integer, const Dest& dest, const Src& src0,
-                 const Src& src1, const Src& src2, bool saturate = false) {
+                 const Src& src1, const Src& src2, bool saturate = false,
+                 uint32_t extra_opcode_bits = 0) {
     uint32_t dest_write_mask = dest.GetMask();
     uint32_t operands_length = dest.GetLength() + src0.GetLength(dest_write_mask) +
                                src1.GetLength(dest_write_mask) + src2.GetLength(dest_write_mask);
     code_.reserve(code_.size() + 1 + operands_length);
-    code_.push_back(OpcodeToken(opcode, operands_length, saturate));
+    code_.push_back(OpcodeToken(opcode, operands_length, saturate) | extra_opcode_bits);
     dest.Write(code_);
     src0.Write(code_, (src_are_integer & 0b1) != 0, dest_write_mask);
     src1.Write(code_, (src_are_integer & 0b10) != 0, dest_write_mask);
@@ -2398,6 +2404,7 @@ class Assembler {
 
   std::vector<uint32_t>& code_;
   Statistics& stat_;
+  uint32_t precise_bits_ = 0;
 };
 
 }  // namespace rex::graphics::dxbc

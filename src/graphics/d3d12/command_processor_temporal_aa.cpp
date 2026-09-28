@@ -18,6 +18,8 @@
 #include <rex/graphics/d3d12/command_processor.h>
 #include <rex/graphics/temporal_aa_policy.h>
 #include <rex/ui/d3d12/d3d12_util.h>
+#include <rex/ui/d3d12/streamline_bridge.h>
+#include <rex/ui/frame_latency.h>
 
 #include <atomic>
 #include <chrono>
@@ -100,6 +102,8 @@ constexpr uint32_t kTemporalAaFlagUpscalerOutput = 4;
 // Upscaler colour in linear light (the scene colour squared) instead of the
 // title's square-root encoding.
 constexpr uint32_t kTemporalAaFlagLinearUpscalerColor = 8;
+// With kTemporalAaFlagUpscalerInputs: motion vectors only (Frame Generation).
+constexpr uint32_t kTemporalAaFlagMotionOnly = 16;
 
 // The street camera (phase 1 captures): reversed depth, near ~1.8, far
 // ~22,500 world units; FSR uses the planes only for its depth heuristics.
@@ -229,6 +233,17 @@ void D3D12CommandProcessor::TemporalAaInitialize() {
   temporal_aa_enabled_ = from_setting || REXCVAR_GET(gpu_temporal_aa);
   temporal_aa_jitter_draw_ = false;
   temporal_aa_jitter_[0] = temporal_aa_jitter_[1] = 0.0f;
+  // NVIDIA DLSS Frame Generation (development test) without temporal AA: the
+  // same frame tracking for its inputs only.
+  temporal_aa_motion_only_ =
+      !temporal_aa_enabled_ && ui::d3d12::streamline::FrameGenerationActive();
+  if (temporal_aa_motion_only_) {
+    temporal_aa_enabled_ = true;
+    temporal_aa_frame_ = std::make_unique<TemporalAaFrame>();
+    std::fprintf(stderr, "REX_TEMPORAL_AA enabled=1 method=motion_only (frame generation)\n");
+    std::fflush(stderr);
+    return;
+  }
   if (!temporal_aa_enabled_) return;
   temporal_aa_frame_ = std::make_unique<TemporalAaFrame>();
   const std::string method = from_setting ? setting : REXCVAR_GET(gpu_temporal_aa_method);
@@ -678,7 +693,7 @@ void D3D12CommandProcessor::TemporalAaDraw(uint64_t vertex_shader_hash,
   // 352x18 texture resolved to 0x1F191000 that grades the composite), which
   // shifted the grading by a sub-texel and tinted the shadows magenta/green.
   temporal_aa_jitter_draw_ =
-      frame.armed && depth_tested && frame.scene_target_valid &&
+      !temporal_aa_motion_only_ && frame.armed && depth_tested && frame.scene_target_valid &&
       regs[XE_GPU_REG_RB_SURFACE_INFO] == frame.scene_surface_info &&
       (regs[XE_GPU_REG_RB_COLOR_INFO] & 0xFFF) == frame.scene_color_edram_base;
   // Camera vote: depth-writing full-frame geometry (world and objects).
@@ -720,6 +735,36 @@ void D3D12CommandProcessor::TemporalAaCopy() {
 
 void D3D12CommandProcessor::TemporalAaEndFrame() {
   TemporalAaFrame& frame = *temporal_aa_frame_;
+  if (temporal_aa_motion_only_) {
+    // This swap's frame (called after the swap took its frame id): its Frame
+    // Generation inputs, or none (menus, loading: Frame Generation stays off).
+    FrameGenerationPending& pending = frame_generation_pending_;
+    const uint32_t latency_frame = ui::frame_latency::RenderSubmitFrame();
+    if (pending.valid && frame.resolved) {
+      const FrameGenerationInputSlot& slot = frame_generation_inputs_[pending.slot];
+      ui::d3d12::streamline::FrameGenerationCamera camera = {};
+      for (uint32_t i = 0; i < 16; ++i) {
+        camera.view_to_clip[i] = float(pending.camera.m[i]);
+        camera.clip_to_previous_clip[i] =
+            pending.history ? float(pending.reproject[i]) : (i % 5 == 0 ? 1.0f : 0.0f);
+      }
+      for (uint32_t i = 0; i < 3; ++i) camera.position[i] = float(pending.camera.position[i]);
+      const double y_scale = std::sqrt(pending.camera.m[4] * pending.camera.m[4] +
+                                       pending.camera.m[5] * pending.camera.m[5] +
+                                       pending.camera.m[6] * pending.camera.m[6]);
+      camera.fov_y = y_scale > 0.0 ? float(2.0 * std::atan(1.0 / y_scale)) : 1.0f;
+      camera.near_plane = kCameraNear;
+      camera.far_plane = kCameraFar;
+      camera.reset = !pending.history;
+      ui::d3d12::streamline::FrameGenerationSetInputs(latency_frame, slot.depth.Get(),
+                                                      slot.motion.Get(), pending.width,
+                                                      pending.height, &camera);
+    } else {
+      ui::d3d12::streamline::FrameGenerationSetInputs(latency_frame, nullptr, nullptr, 0, 0,
+                                                      nullptr);
+    }
+    pending.valid = false;
+  }
   if (!frame.resolved) {
     // No composite this frame (menus, loading): no history, no jitter.
     frame.history_valid = false;
@@ -735,7 +780,7 @@ void D3D12CommandProcessor::TemporalAaEndFrame() {
   frame.next_target_valid = false;
   ++frame.frame;
   double x = 0.0, y = 0.0;
-  if (frame.armed) temporal_aa::Jitter(uint32_t(frame.frame), x, y);
+  if (frame.armed && !temporal_aa_motion_only_) temporal_aa::Jitter(uint32_t(frame.frame), x, y);
   // Host pixels: the viewport is at the draw resolution scale.
   temporal_aa_jitter_[0] = float(x);
   temporal_aa_jitter_[1] = float(y);
@@ -854,6 +899,7 @@ bool D3D12CommandProcessor::TemporalAaResolve() {
       !TemporalAaEnsureResources(color.width, color.height)) {
     return false;
   }
+  if (temporal_aa_motion_only_) return TemporalAaFrameGenerationInputs(color, depth, camera);
 
   // An upscaler replaces the blend: the same pass writes its inputs. When it
   // fails, the built-in resolve takes over with a fresh history (the history
@@ -1046,6 +1092,160 @@ bool D3D12CommandProcessor::TemporalAaResolve() {
                  frame.scene_target_valid ? 1u : 0u, frame.scene_surface_info,
                  frame.scene_color_edram_base, upscaler ? UpscalerName(upscaler->kind) : "taa",
                  static_cast<unsigned long long>(upscaler ? upscaler->evaluations : 0));
+    std::fflush(stderr);
+  }
+  return true;
+}
+
+bool D3D12CommandProcessor::TemporalAaFrameGenerationEnsure(uint32_t width, uint32_t height) {
+  if (frame_generation_inputs_[0].depth && frame_generation_input_width_ == width &&
+      frame_generation_input_height_ == height) {
+    return true;
+  }
+  // Older slots may still be read by submitted work: deleted after it.
+  auto release = [this](Microsoft::WRL::ComPtr<ID3D12Resource>& resource) {
+    if (!resource) return;
+    resource->AddRef();
+    resources_for_deletion_.emplace_back(submission_current_, resource.Get());
+    resource.Reset();
+  };
+  for (FrameGenerationInputSlot& slot : frame_generation_inputs_) {
+    release(slot.depth);
+    release(slot.motion);
+  }
+  ID3D12Device* device = GetD3D12Provider().GetDevice();
+  D3D12_HEAP_PROPERTIES heap = {};
+  heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+  D3D12_RESOURCE_DESC desc = {};
+  desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  desc.Width = width;
+  desc.Height = height;
+  desc.DepthOrArraySize = 1;
+  desc.MipLevels = 1;
+  desc.SampleDesc.Count = 1;
+  for (FrameGenerationInputSlot& slot : frame_generation_inputs_) {
+    desc.Format = DXGI_FORMAT_R32_FLOAT;
+    desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+    if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                               D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                               nullptr, IID_PPV_ARGS(&slot.depth)))) {
+      return false;
+    }
+    desc.Format = DXGI_FORMAT_R16G16_FLOAT;
+    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                               D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                               nullptr, IID_PPV_ARGS(&slot.motion)))) {
+      return false;
+    }
+  }
+  frame_generation_input_width_ = width;
+  frame_generation_input_height_ = height;
+  std::fprintf(stderr, "REX_TEMPORAL_AA frame_generation_inputs size=%ux%u slots=%u\n", width,
+               height, kFrameGenerationInputSlots);
+  std::fflush(stderr);
+  return true;
+}
+
+// Frame Generation inputs (motion-only tracking): the frame's camera motion
+// vectors (the resolve's upscaler-input pass without colour) and a typed copy
+// of its scene depth into the next ring slot; the scene colour is untouched.
+bool D3D12CommandProcessor::TemporalAaFrameGenerationInputs(
+    const D3D12TextureCache::TemporalAaTexture& color,
+    const D3D12TextureCache::TemporalAaTexture& depth, const temporal_aa::Camera& camera) {
+  TemporalAaFrame& frame = *temporal_aa_frame_;
+  if ((depth.format != DXGI_FORMAT_R32_FLOAT && depth.format != DXGI_FORMAT_R32_TYPELESS) ||
+      !TemporalAaFrameGenerationEnsure(color.width, color.height)) {
+    return false;
+  }
+  FrameGenerationPending& pending = frame_generation_pending_;
+  pending.history = frame.history_valid && !temporal_aa::IsCut(camera, frame.previous_camera) &&
+                    temporal_aa::ReprojectionMatrix(camera, frame.previous_camera, pending.reproject);
+  TemporalAaConstants constants = {};
+  for (uint32_t i = 0; i < 16; ++i) {
+    constants.reproject[i] =
+        pending.history ? float(pending.reproject[i]) : (i % 5 == 0 ? 1.0f : 0.0f);
+  }
+  constants.size[0] = color.width;
+  constants.size[1] = color.height;
+  constants.size_inv[0] = 1.0f / float(color.width);
+  constants.size_inv[1] = 1.0f / float(color.height);
+  constants.flags = (pending.history ? kTemporalAaFlagHistory : 0u) |
+                    kTemporalAaFlagUpscalerInputs | kTemporalAaFlagMotionOnly;
+
+  frame_generation_input_slot_ = (frame_generation_input_slot_ + 1) % kFrameGenerationInputSlots;
+  const FrameGenerationInputSlot& slot = frame_generation_inputs_[frame_generation_input_slot_];
+  constexpr uint32_t kTables = uint32_t(TemporalAaRootParameter::kCount) - 1;
+  ui::d3d12::util::DescriptorCpuGpuHandlePair descriptors[kTables];
+  if (!RequestOneUseSingleViewDescriptors(kTables, descriptors)) return false;
+  ID3D12Device* device = GetD3D12Provider().GetDevice();
+  auto write_srv = [&](ID3D12Resource* resource, DXGI_FORMAT format,
+                       D3D12_CPU_DESCRIPTOR_HANDLE handle) {
+    D3D12_SHADER_RESOURCE_VIEW_DESC desc = {};
+    desc.Format = format;
+    desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    desc.Texture2D.MipLevels = 1;
+    device->CreateShaderResourceView(resource, &desc, handle);
+  };
+  auto write_uav = [&](ID3D12Resource* resource, DXGI_FORMAT format,
+                       D3D12_CPU_DESCRIPTOR_HANDLE handle) {
+    D3D12_UNORDERED_ACCESS_VIEW_DESC desc = {};
+    desc.Format = format;
+    desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    device->CreateUnorderedAccessView(resource, nullptr, &desc, handle);
+  };
+  // Only t1 (depth) and u0 (motion) are used; the other views stay valid.
+  write_srv(color.resource, DXGI_FORMAT_R16G16B16A16_UNORM, descriptors[0].first);
+  write_srv(depth.resource, DXGI_FORMAT_R32_FLOAT, descriptors[1].first);
+  write_srv(temporal_aa_history_[0].Get(), DXGI_FORMAT_R16G16B16A16_FLOAT, descriptors[2].first);
+  write_uav(slot.motion.Get(), DXGI_FORMAT_R16G16_FLOAT, descriptors[3].first);
+  write_uav(temporal_aa_output_.Get(), DXGI_FORMAT_R16G16B16A16_UNORM, descriptors[4].first);
+  write_uav(temporal_aa_history_[1].Get(), DXGI_FORMAT_R16G16B16A16_FLOAT, descriptors[5].first);
+  PushTransitionBarrier(slot.motion.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  deferred_command_list_.D3DSetComputeRootSignature(temporal_aa_root_signature_.Get());
+  deferred_command_list_.D3DSetComputeRoot32BitConstants(
+      UINT(TemporalAaRootParameter::kConstants), sizeof(constants) / sizeof(uint32_t), &constants,
+      0);
+  for (uint32_t i = 0; i < kTables; ++i) {
+    deferred_command_list_.D3DSetComputeRootDescriptorTable(
+        UINT(TemporalAaRootParameter::kColor) + i, descriptors[i].second);
+  }
+  SetExternalPipeline(temporal_aa_pipeline_.Get());
+  SubmitBarriers();
+  deferred_command_list_.D3DDispatch((color.width + 7) / 8, (color.height + 7) / 8, 1);
+  PushTransitionBarrier(slot.motion.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+  // The typed depth copy.
+  texture_cache_->TransitionTemporalAaTexture(depth.handle, D3D12_RESOURCE_STATE_COPY_SOURCE);
+  PushTransitionBarrier(slot.depth.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                        D3D12_RESOURCE_STATE_COPY_DEST);
+  SubmitBarriers();
+  deferred_command_list_.D3DCopyResource(slot.depth.Get(), depth.resource);
+  PushTransitionBarrier(slot.depth.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+  texture_cache_->TransitionTemporalAaTexture(
+      depth.handle, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
+                        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+  SubmitBarriers();
+
+  pending.valid = true;
+  pending.slot = frame_generation_input_slot_;
+  pending.width = color.width;
+  pending.height = color.height;
+  pending.camera = camera;
+  frame.previous_camera = camera;
+  frame.history_valid = true;
+  ++frame.resolves;
+  if ((frame.resolves & 0x3FF) == 1 && frame.reports < 64) {
+    ++frame.reports;
+    std::fprintf(stderr,
+                 "REX_TEMPORAL_AA resolves=%llu size=%ux%u history=%u camera=%.1f,%.1f,%.1f "
+                 "votes=%u method=motion_only\n",
+                 static_cast<unsigned long long>(frame.resolves), color.width, color.height,
+                 pending.history ? 1u : 0u, camera.position[0], camera.position[1],
+                 camera.position[2], frame.vote.draws);
     std::fflush(stderr);
   }
   return true;

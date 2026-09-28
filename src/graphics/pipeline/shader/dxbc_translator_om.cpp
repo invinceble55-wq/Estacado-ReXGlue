@@ -19,6 +19,17 @@
 #include <rex/graphics/util/draw.h>
 #include <rex/math.h>
 
+// With ROV, host occlusion queries only see the rasterizer's coverage, so a
+// pixel ending with `ret` (rejected by depth/stencil, alpha test or alpha to
+// coverage) is still counted - the title's auto-exposure, which reads ZPD
+// sample counts, then goes dark. Discarding before such returns keeps those
+// pixels out of the counts (per pixel: a partly covered pixel still counts in
+// full, as rasterized).
+REXCVAR_DEFINE_BOOL(rov_occlusion_discard, true, "GPU",
+                    "With ROV, discard pixels whose samples were all rejected so that occlusion "
+                    "queries (ZPD) don't count them")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 namespace rex::graphics {
 using namespace ucode;
 
@@ -1158,8 +1169,11 @@ void DxbcShaderTranslator::ROV_DepthStencilTest() {
     a_.OpMovC(dxbc::Dest::R(temp, 0b0001), dxbc::Src::R(temp, dxbc::Src::kYYYY),
               dxbc::Src::LF(1.0f), dxbc::Src::R(temp, dxbc::Src::kXXXX));
     // End the shader if nothing is covered in the 2x2 quad after early
-    // depth/stencil.
+    // depth/stencil (discarding first for occlusion queries).
     // temp.x = free
+    if (REXCVAR_GET(rov_occlusion_discard)) {
+      a_.OpDiscard(false, dxbc::Src::R(temp, dxbc::Src::kXXXX));
+    }
     a_.OpRetC(false, dxbc::Src::R(temp, dxbc::Src::kXXXX));
   }
 
@@ -1915,6 +1929,9 @@ void DxbcShaderTranslator::CompletePixelShader_AlphaToMask() {
     // 0:3, but not in 4:7).
     a_.OpAnd(temp_x_dest, dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kXXXX),
              dxbc::Src::LU(0b11111111));
+    if (REXCVAR_GET(rov_occlusion_discard)) {
+      a_.OpDiscard(false, temp_x_src);
+    }
     a_.OpRetC(false, temp_x_src);
   } else {
     dxbc::Src coverage_src(dxbc::Src::R(coverage_temp, coverage_temp_component));
@@ -1984,14 +2001,20 @@ void DxbcShaderTranslator::CompletePixelShader_WriteToROV() {
   // system_temp_rov_params_.y (the depth / stencil sample address) is not
   // needed anymore, can be used for color writing.
 
-  if (!is_depth_only_pixel_shader_) {
+  if (!is_depth_only_pixel_shader_ || REXCVAR_GET(rov_occlusion_discard)) {
     // Check if any sample is still covered after depth testing and writing,
-    // skip color writing completely in this case.
+    // skip color writing completely in this case (and keep the pixel out of
+    // occlusion queries, also for depth-only shaders).
     // temp.x = whether any sample is still covered.
     a_.OpAnd(temp_x_dest, dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kXXXX),
              dxbc::Src::LU(0b1111));
+    if (REXCVAR_GET(rov_occlusion_discard)) {
+      a_.OpDiscard(false, temp_x_src);
+    }
     // temp.x = free.
-    a_.OpRetC(false, temp_x_src);
+    if (!is_depth_only_pixel_shader_) {
+      a_.OpRetC(false, temp_x_src);
+    }
   }
 
   // Write color values.
@@ -2840,6 +2863,9 @@ void DxbcShaderTranslator::CompletePixelShader() {
       a_.OpEndIf();
       // Discard the pixel if it has failed the test.
       if (edram_rov_used_) {
+        if (REXCVAR_GET(rov_occlusion_discard)) {
+          a_.OpDiscard(false, alpha_test_mask_src);
+        }
         a_.OpRetC(false, alpha_test_mask_src);
       } else {
         a_.OpDiscard(false, alpha_test_mask_src);

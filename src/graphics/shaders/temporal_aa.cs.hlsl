@@ -102,9 +102,12 @@ void main(uint3 id : SV_DispatchThreadID) {
     // pixels (+y down; jitter not included), as DLSS, FSR and XeSS expect.
     // The title's scene colour is square-root encoded (its final composite
     // squares it before tone mapping): flag 8 hands the upscaler linear light.
-    float3 scene = current_color[pixel].rgb * kColorScale;
-    if ((flags & 8u) != 0u) scene *= scene;
-    out_upscaler_color[pixel] = float4(scene, 1.0);
+    // Flag 16: motion vectors only (Frame Generation inputs), no colour.
+    if ((flags & 16u) == 0u) {
+      float3 scene = current_color[pixel].rgb * kColorScale;
+      if ((flags & 8u) != 0u) scene *= scene;
+      out_upscaler_color[pixel] = float4(scene, 1.0);
+    }
     float2 position = float2(pixel) + 0.5 - jitter;
     float4 ndc = float4(position.x * 2.0 * size_inv.x - 1.0, 1.0 - position.y * 2.0 * size_inv.y,
                         1.0 - current_depth[pixel], 1.0);

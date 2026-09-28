@@ -43,6 +43,18 @@ REXCVAR_DEFINE_BOOL(direct_host_resolve, true, "GPU",
                      "Resolve from host render targets directly to shared memory when possible")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+// Shaders that rebuild positions from a resolved depth texture sample it at
+// the pixel centre, while a single-sample resolve of multisampled depth stores
+// the depth of one sample, a quarter of a pixel away. On surfaces steep to the
+// camera that moves the rebuilt position behind the surface by more than the
+// shadow-map bias covers, and The Darkness's shadowed lights darken whole
+// triangles (#6, Jenny's shoulder, at every resolution scale).
+REXCVAR_DEFINE_BOOL(resolve_depth_pixel_center, true, "GPU",
+                    "When resolving 2x MSAA depth, store the depth at the pixel centre (the mean "
+                    "of both samples) where both samples and the neighbouring pixels lie on one "
+                    "surface; edges keep the depth of the selected sample")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_UINT32(
     draw_resolution_scale_threshold, 0, "GPU",
     "Tile-aligned surface pitch in pixels at or below which host render "

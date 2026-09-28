@@ -817,6 +817,13 @@ class D3D12CommandProcessor : public CommandProcessor {
   Microsoft::WRL::ComPtr<ID3D12Resource> resolve_downscale_buffer_;
   uint32_t resolve_downscale_buffer_size_ = 0;
 
+  // d3d12_debug_gpu_spin (diagnostics): steps of the frame-start compute
+  // chain, 0 when off.
+  Microsoft::WRL::ComPtr<ID3D12RootSignature> debug_gpu_spin_root_signature_;
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> debug_gpu_spin_pipeline_;
+  Microsoft::WRL::ComPtr<ID3D12Resource> debug_gpu_spin_buffer_;
+  uint32_t debug_gpu_spin_steps_ = 0;
+
   // PWL gamma ramp can result in values with more precision than 10bpc. Though
   // those sub-10bpc bits don't have any noticeable visual effect, so normally
   // R10G10B10A2_UNORM is enough. But what's the most important is that for the
@@ -906,6 +913,33 @@ class D3D12CommandProcessor : public CommandProcessor {
     uint64_t reports = 0;
   };
   bool temporal_aa_enabled_ = false;
+  // Tracking only for NVIDIA DLSS Frame Generation (no jitter, the scene
+  // colour untouched): each resolved frame's motion vectors and a typed
+  // depth copy go into a ring slot that stays unchanged until its present.
+  bool temporal_aa_motion_only_ = false;
+  static constexpr uint32_t kFrameGenerationInputSlots = 4;
+  struct FrameGenerationInputSlot {
+    Microsoft::WRL::ComPtr<ID3D12Resource> depth;
+    Microsoft::WRL::ComPtr<ID3D12Resource> motion;
+  };
+  std::array<FrameGenerationInputSlot, kFrameGenerationInputSlots> frame_generation_inputs_;
+  uint32_t frame_generation_input_width_ = 0;
+  uint32_t frame_generation_input_height_ = 0;
+  uint32_t frame_generation_input_slot_ = 0;
+  // This frame's inputs, handed over with the frame id at its swap.
+  struct FrameGenerationPending {
+    bool valid = false;
+    uint32_t slot = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    bool history = false;
+    temporal_aa::Camera camera;
+    std::array<double, 16> reproject{};
+  } frame_generation_pending_;
+  bool TemporalAaFrameGenerationEnsure(uint32_t width, uint32_t height);
+  bool TemporalAaFrameGenerationInputs(const D3D12TextureCache::TemporalAaTexture& color,
+                                       const D3D12TextureCache::TemporalAaTexture& depth,
+                                       const temporal_aa::Camera& camera);
   bool temporal_aa_jitter_draw_ = false;
   float temporal_aa_jitter_[2] = {};
   std::unique_ptr<TemporalAaFrame> temporal_aa_frame_;

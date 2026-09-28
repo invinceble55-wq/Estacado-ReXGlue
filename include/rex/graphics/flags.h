@@ -43,6 +43,7 @@ REXCVAR_DECLARE(bool, native_2x_msaa);
 REXCVAR_DECLARE(bool, snorm16_render_target_full_range);
 REXCVAR_DECLARE(bool, mrt_edram_used_range_clamp_to_min);
 REXCVAR_DECLARE(bool, direct_host_resolve);
+REXCVAR_DECLARE(bool, resolve_depth_pixel_center);
 
 // GPU Textures
 REXCVAR_DECLARE(bool, gpu_allow_invalid_fetch_constants);
@@ -101,6 +102,10 @@ REXCVAR_DECLARE(bool, d3d12_dxbc_disasm);
 REXCVAR_DECLARE(bool, d3d12_dxbc_disasm_dxilconv);
 REXCVAR_DECLARE(int32_t, d3d12_pipeline_creation_threads);
 REXCVAR_DECLARE(bool, d3d12_tessellation_wireframe);
+REXCVAR_DECLARE(bool, d3d12_absolute_polygon_offset);
+REXCVAR_DECLARE(bool, d3d12_conservative_sync);
+REXCVAR_DECLARE(bool, d3d12_render_target_uncompressed);
+REXCVAR_DECLARE(bool, d3d12_transfer_stencil_clear_by_draw);
 REXCVAR_DECLARE(bool, d3d12_tiled_shared_memory);
 REXCVAR_DECLARE(std::string, render_target_path_d3d12);
 // Legacy backend compatibility aliases for shared readback controls.

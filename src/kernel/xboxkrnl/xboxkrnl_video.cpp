@@ -32,6 +32,7 @@
 #include <rex/system/kernel_state.h>
 #include <rex/system/xtypes.h>
 #include <rex/ui/flags.h>
+#include <rex/ui/frame_latency.h>
 
 namespace {
 // Display gamma type: 0 - linear, 1 - sRGB (CRT), 2 - BT.709 (HDTV), 3 - power
@@ -518,6 +519,10 @@ void VdSwap_entry(mapped_void buffer_ptr,      // ptr into primary ringbuffer
   for (uint32_t i = offset; i < 64; i++) {
     dwords[i] = xenos::MakePacketType2();
   }
+
+  // Frame tracking: the frame's commands are complete; its swap packet is
+  // queued for the command processor in this order.
+  rex::ui::frame_latency::GuestSwap();
 }
 
 void RegisterVideoExports(rex::runtime::ExportResolver* export_resolver,

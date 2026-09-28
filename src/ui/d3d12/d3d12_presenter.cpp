@@ -27,6 +27,8 @@
 #include <rex/ui/d3d12/d3d12_present_policy.h>
 #include <rex/ui/d3d12/d3d12_provider.h>
 #include <rex/ui/d3d12/d3d12_util.h>
+#include <rex/ui/d3d12/streamline_bridge.h>
+#include <rex/ui/frame_latency.h>
 #include <rex/ui/guest_frame_limiter.h>
 #include <rex/ui/present_statistics.h>
 #include <rex/ui/surface_win.h>
@@ -457,8 +459,8 @@ D3D12Presenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_sur
     // VRR policies; only Present with DXGI_PRESENT_ALLOW_TEARING can tear.
     // The latency flag is always retained so SetMaximumFrameLatency is valid.
     swap_chain_desc.Flags = ResolveHostSwapChainFlags(dxgi_supports_tearing_);
-    IDXGIFactory2* dxgi_factory = provider_.GetDXGIFactory();
-    ID3D12CommandQueue* direct_queue = provider_.GetDirectQueue();
+    IDXGIFactory2* dxgi_factory = provider_.GetSwapChainFactory();
+    ID3D12CommandQueue* direct_queue = provider_.GetSwapChainQueue();
     Microsoft::WRL::ComPtr<IDXGISwapChain1> swap_chain_1;
     switch (surface_type) {
 #if WINAPI_FAMILY_PARTITION(WINAPI_PARTITION_DESKTOP | WINAPI_PARTITION_GAMES)
@@ -1337,8 +1339,16 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
   const auto present_start = record_present_timing
       ? std::chrono::steady_clock::now()
       : std::chrono::steady_clock::time_point{};
+  // Frame tracking (latency markers, the low-latency queue limit) for the
+  // first present of the guest frame.
+  const uint32_t latency_frame =
+      frame_latency::BeginPresent(guest_output_properties.latency_frame);
+  streamline::FrameGenerationBeforePresent(
+      guest_output_properties.latency_frame, latency_frame, !frame_latency::InMenu(),
+      paint_context_.swap_chain_width, paint_context_.swap_chain_height);
   HRESULT present_result = paint_context_.swap_chain->Present(
       present_parameters.sync_interval, present_parameters.flags);
+  frame_latency::EndPresent(latency_frame);
   const uint64_t present_duration_us = record_present_timing
       ? uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
                      std::chrono::steady_clock::now() - present_start)

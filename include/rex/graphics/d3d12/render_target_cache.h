@@ -543,6 +543,10 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
       // guest pixel; native_layout instead emits the plain 1x EDRAM layout.
       uint32_t source_scale_native : 1;
       uint32_t native_layout : 1;
+      // 2x MSAA depth for a resolve: each sample receives the depth at the
+      // pixel centre where the pixel lies on one surface (see
+      // resolve_depth_pixel_center).
+      uint32_t depth_center : 1;
     };
 
     DumpPipelineKey() : key(0) { static_assert_size(*this, sizeof(key)); }
@@ -793,9 +797,12 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
 
   // Writes contents of host render targets within rectangles from
   // ResolveInfo::GetCopyEdramTileSpan to edram_buffer_. native_layout selects
-  // the plain 1x EDRAM layout for an all-native resolve source.
+  // the plain 1x EDRAM layout for an all-native resolve source. depth_center
+  // writes the pixel-centre depth of 2x MSAA depth render targets (for depth
+  // resolves only - other dumps must keep the exact samples).
   bool DumpRenderTargets(uint32_t dump_base, uint32_t dump_row_length_used, uint32_t dump_rows,
-                         uint32_t dump_pitch, bool native_layout = false);
+                         uint32_t dump_pitch, bool native_layout = false,
+                         bool depth_center = false);
 
   bool use_stencil_reference_output_ = false;
 
@@ -879,6 +886,10 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
   ID3D12RootSignature* uint32_rtv_clear_root_signature_ = nullptr;
   // [32 or 32_32][MSAA samples].
   ID3D12PipelineState* uint32_rtv_clear_pipelines_[2][size_t(xenos::MsaaSamples::k4X) + 1] = {};
+  // d3d12_transfer_stencil_clear_by_draw (diagnostics), with the clear root
+  // signature: [D24S8 or D24FS8][MSAA samples], null when off.
+  ID3D12PipelineState* transfer_stencil_clear_pipelines_[2]
+                                                       [size_t(xenos::MsaaSamples::k4X) + 1] = {};
 
   std::vector<Transfer> clear_transfers_[2];
 
