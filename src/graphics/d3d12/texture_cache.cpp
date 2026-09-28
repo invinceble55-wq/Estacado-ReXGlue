@@ -93,6 +93,38 @@ REXCVAR_DEFINE_BOOL(embedded_pc_scene_history, false, "GPU/Experimental",
     "Own rendered scene-color inputs on GPU; no temporal reconstruction activation")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
+// #16 diagnostic: dedicated glow images that reproduce the scaled texture
+// exactly (reconstructed images only): separates the image mechanics (memory,
+// views, barriers, staleness) from the reconstruction math.
+REXCVAR_DEFINE_BOOL(d3d12_debug_glow_image_copy, false, "GPU/D3D12",
+    "Diagnostics: reconstructed dedicated glow images are exact copies of the scaled texture")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+// #16 diagnostic: dumps of dedicated glow image regenerations (source texture,
+// cells, image) as DDS files in the texture dump folder.
+REXCVAR_DEFINE_UINT32(d3d12_debug_glow_image_dump, 0, "GPU/D3D12",
+    "Diagnostics: guest base address of the texture whose glow image regenerations are "
+    "dumped (0 = off)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_UINT32(d3d12_debug_glow_image_dump_frame, 900, "GPU/D3D12",
+    "Diagnostics: the frame after which d3d12_debug_glow_image_dump starts (8 regenerations)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+// #16 diagnostic: reconstructed images box-reduce straight from the scaled
+// texture instead of reading the intermediate cells image.
+REXCVAR_DEFINE_BOOL(d3d12_debug_glow_image_direct, false, "GPU/D3D12",
+    "Diagnostics: reconstructed dedicated glow images skip the intermediate cells image")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+// #16 diagnostic: the scaled resolve buffer's tiles come from heaps created
+// not zeroed, so reading a range no resolve or initialization wrote returns
+// whatever that memory held before (often zeros on a GPU with plenty of free
+// memory, old data on one that reuses it). Filling every new heap with 0xFF
+// bytes (white, float NaN) makes such reads visible on any GPU.
+REXCVAR_DEFINE_BOOL(d3d12_debug_poison_scaled_resolve, false, "GPU/D3D12",
+    "Diagnostics: fill every new scaled-resolve memory heap with 0xFF bytes so reads of "
+    "resolve memory that nothing wrote become visible")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 REXCVAR_DEFINE_BOOL(d3d12_texture_heap_pool, true, "GPU",
     "Place textures in pre-created heaps instead of one committed allocation each "
     "(avoids per-texture driver allocation and residency waits when textures first appear)")
@@ -147,6 +179,9 @@ void D3D12TextureCache::ArmTextureReadbackDiagnostic(
 
 // Generated with `xb buildshaders`.
 namespace shaders {
+// scripts/build-debug-shaders.ps1 (FXC) from shaders/glow_*.cs.hlsl (#16).
+#include "../shaders/bytecode/d3d12_5_1/glow_box_cs.h"
+#include "../shaders/bytecode/d3d12_5_1/glow_reconstruct_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/scaled_resolve_initialize_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/texture_load_128bpb_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/texture_load_128bpb_scaled_cs.h"
@@ -486,6 +521,7 @@ D3D12TextureCache::D3D12TextureCache(const RegisterFile& register_file,
       bindless_resources_used_(bindless_resources_used) {}
 
 D3D12TextureCache::~D3D12TextureCache() {
+  ReleaseGlowImages(true);
   // While the texture descriptor cache still exists (referenced by
   // ~D3D12Texture), destroy all textures.
   DestroyAllTextures(true);
@@ -783,6 +819,7 @@ bool D3D12TextureCache::Initialize() {
 
 void D3D12TextureCache::ClearCache() {
   InvalidateOwnedSceneColor();
+  ReleaseGlowImages(true);
   TextureCache::ClearCache();
 
   // Clear texture descriptor cache.
@@ -810,6 +847,13 @@ void D3D12TextureCache::BeginSubmission(uint64_t new_submission_index) {
 
 void D3D12TextureCache::BeginFrame() {
   TextureCache::BeginFrame();
+  ++glow_frame_;
+  if (!glow_images_.empty()) {
+    EvictUnusedGlowImages();
+  }
+  if (!pending_glow_dumps_.empty()) {
+    ProcessGlowDumps();
+  }
   UpdatePromptIcons();
   if (!pack_index_built_ && TextureReplacementEnabled()) {
     EnsurePackIndex();
@@ -934,6 +978,49 @@ void D3D12TextureCache::RequestTextures(uint32_t used_texture_mask) {
           D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
               D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     }
+  }
+
+  // Dedicated glow images (#16) for this draw's requested fetches; nothing to
+  // do (on the hot path of every draw) while none is requested or bound.
+  if (glow_image_request_mask_ || glow_image_bound_mask_) {
+    uint32_t bound_mask = 0;
+    GlowImage* bound[32] = {};
+    uint32_t bound_descriptors[32] = {};
+    uint32_t requests = glow_image_request_mask_ & used_texture_mask;
+    glow_image_request_mask_ = 0;
+    while (rex::bit_scan_forward(requests, &index)) {
+      requests &= ~(uint32_t(1) << index);
+      const TextureBinding* binding = GetValidTextureBinding(index);
+      D3D12Texture* texture =
+          binding ? static_cast<D3D12Texture*>(binding->texture) : nullptr;
+      if (!texture || !texture->key().scaled_resolve || texture->replaced()) {
+        continue;
+      }
+      const GlowImageRequest& request = glow_image_requests_[index];
+      native_resolve::Rect tracked[4];
+      size_t tracked_count = 0;
+      if (request.footprint == GlowImageFootprint::kSourceNative) {
+        // Like the reconstruction: without tracked native content the
+        // texture is sampled normally.
+        tracked_count = GetActiveNativeResolveRegions(index, tracked, 4);
+        if (!tracked_count) continue;
+      }
+      GlowImage* image =
+          PrepareGlowImage(*texture, binding->host_swizzle, request, tracked, tracked_count);
+      if (!image) continue;
+      image->last_used_submission = command_processor_.GetCurrentSubmission();
+      image->last_used_frame = glow_frame_;
+      bound_mask |= uint32_t(1) << index;
+      bound[index] = image;
+      bound_descriptors[index] = image->srv_descriptor;
+    }
+    if (bound_mask != glow_image_bound_mask_ ||
+        std::memcmp(bound_descriptors, glow_image_bound_descriptors_, sizeof(bound_descriptors))) {
+      ++glow_image_binding_generation_;
+    }
+    glow_image_bound_mask_ = bound_mask;
+    std::memcpy(glow_image_bound_, bound, sizeof(bound));
+    std::memcpy(glow_image_bound_descriptors_, bound_descriptors, sizeof(bound_descriptors));
   }
 
   textures_remaining = used_texture_mask;
@@ -1713,6 +1800,15 @@ void D3D12TextureCache::WriteActiveTextureBindfulSRV(
   uint32_t descriptor_index = UINT32_MAX;
   Texture* texture = nullptr;
   uint32_t fetch_constant_index = host_shader_binding.fetch_constant;
+  if (IsActiveTextureGlowImage(fetch_constant_index) && !host_shader_binding.is_signed &&
+      host_shader_binding.dimension == xenos::FetchOpDimension::k2D) {
+    // A dedicated glow image (#16) replaces the resolution-scaled texture.
+    command_processor_.GetD3D12Provider().GetDevice()->CopyDescriptorsSimple(
+        1, handle,
+        GetTextureDescriptorCPUHandle(glow_image_bound_descriptors_[fetch_constant_index]),
+        D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    return;
+  }
   const TextureBinding* binding = GetValidTextureBinding(fetch_constant_index);
   if (binding && AreDimensionsCompatible(host_shader_binding.dimension, binding->key.dimension)) {
     bool force_special_view = binding->key.dimension == xenos::DataDimension::k3D &&
@@ -1799,6 +1895,11 @@ uint32_t D3D12TextureCache::GetActiveTextureBindlessSRVIndex(
   assert_true(bindless_resources_used_);
   uint32_t descriptor_index = UINT32_MAX;
   uint32_t fetch_constant_index = host_shader_binding.fetch_constant;
+  if (IsActiveTextureGlowImage(fetch_constant_index) && !host_shader_binding.is_signed &&
+      host_shader_binding.dimension == xenos::FetchOpDimension::k2D) {
+    // A dedicated glow image (#16) replaces the resolution-scaled texture.
+    return glow_image_bound_descriptors_[fetch_constant_index];
+  }
   const TextureBinding* binding = GetValidTextureBinding(fetch_constant_index);
   if (binding && AreDimensionsCompatible(host_shader_binding.dimension, binding->key.dimension)) {
     bool force_special_view = binding->key.dimension == xenos::DataDimension::k3D &&
@@ -2168,8 +2269,52 @@ bool D3D12TextureCache::EnsureScaledResolveMemoryCommitted(uint32_t start_unscal
           &range_tile_count, D3D12_TILE_MAPPING_FLAG_NONE);
     }
     command_processor_.NotifyQueueOperationsDoneDirectly();
+    if (REXCVAR_GET(d3d12_debug_poison_scaled_resolve)) {
+      PoisonScaledResolveHeap(i, buffer_indices[0]);
+    }
   }
   return true;
+}
+
+void D3D12TextureCache::PoisonScaledResolveHeap(uint32_t heap_index, size_t buffer_index) {
+  if (!debug_poison_upload_buffer_) {
+    D3D12_RESOURCE_DESC desc;
+    ui::d3d12::util::FillBufferResourceDesc(desc, kScaledResolveHeapSize,
+                                            D3D12_RESOURCE_FLAG_NONE);
+    ID3D12Device* device = command_processor_.GetD3D12Provider().GetDevice();
+    if (FAILED(device->CreateCommittedResource(
+            &ui::d3d12::util::kHeapPropertiesUpload, D3D12_HEAP_FLAG_NONE, &desc,
+            D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+            IID_PPV_ARGS(&debug_poison_upload_buffer_)))) {
+      return;
+    }
+    void* mapping = nullptr;
+    D3D12_RANGE read_range = {0, 0};
+    if (FAILED(debug_poison_upload_buffer_->Map(0, &read_range, &mapping))) {
+      debug_poison_upload_buffer_.Reset();
+      return;
+    }
+    std::memset(mapping, 0xFF, kScaledResolveHeapSize);
+    debug_poison_upload_buffer_->Unmap(0, nullptr);
+  }
+  ScaledResolveVirtualBuffer& buffer = *scaled_resolve_2gb_buffers_[buffer_index];
+  const uint64_t offset =
+      (uint64_t(heap_index) << kScaledResolveHeapSizeLog2) - (uint64_t(buffer_index) << 30);
+  const D3D12_RESOURCE_STATES old_state =
+      buffer.SetResourceState(D3D12_RESOURCE_STATE_COPY_DEST);
+  command_processor_.PushTransitionBarrier(buffer.resource(), old_state,
+                                           D3D12_RESOURCE_STATE_COPY_DEST);
+  command_processor_.SubmitBarriers();
+  command_processor_.GetDeferredCommandList().D3DCopyBufferRegion(
+      buffer.resource(), offset, debug_poison_upload_buffer_.Get(), 0, kScaledResolveHeapSize);
+  buffer.SetResourceState(old_state);
+  command_processor_.PushTransitionBarrier(buffer.resource(), D3D12_RESOURCE_STATE_COPY_DEST,
+                                           old_state);
+  if (debug_poisoned_heaps_++ < 4) {
+    std::fprintf(stderr, "REX_GPU_DEBUG_POISON scaled_resolve_heap=%u buffer=%zu\n",
+                 heap_index, buffer_index);
+    std::fflush(stderr);
+  }
 }
 
 bool D3D12TextureCache::MakeScaledResolveRangeCurrent(uint32_t start_unscaled,
@@ -3590,6 +3735,8 @@ bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, 
         uint64_t(reinterpret_cast<uintptr_t>(texture_resource)), uint64_t(copy_buffer_size), true);
   }
 
+  // Dedicated glow images made from the previous data are stale (#16).
+  d3d12_texture.BumpContentEpoch();
   return true;
 }
 
@@ -4257,6 +4404,15 @@ void D3D12TextureCache::UpdatePackReplacements() {
 }
 
 void D3D12TextureCache::OnD3D12TextureDestroyed(D3D12Texture& texture) {
+  for (size_t i = 0; i < glow_images_.size();) {
+    if (glow_images_[i]->source == &texture) {
+      ReleaseGlowImage(*glow_images_[i], false);
+      glow_images_[i] = std::move(glow_images_.back());
+      glow_images_.pop_back();
+    } else {
+      ++i;
+    }
+  }
   prompt_icon_textures_.erase(&texture);
   for (size_t i = 0; i < textures_awaiting_replacement_.size();) {
     if (textures_awaiting_replacement_[i].first == &texture) {
@@ -5028,6 +5184,498 @@ void D3D12TextureCache::UpdatePromptIcons() {
     std::fflush(stderr);
   }
   prompt_keyboard_shown_ = keyboard;
+}
+
+bool D3D12TextureCache::EnsureGlowPipelines() {
+  if (glow_root_signature_ && glow_box_pipeline_ && glow_reconstruct_pipeline_) {
+    return true;
+  }
+  if (glow_pipelines_attempted_) {
+    return false;
+  }
+  glow_pipelines_attempted_ = true;
+  const ui::d3d12::D3D12Provider& provider = command_processor_.GetD3D12Provider();
+  ID3D12Device* device = provider.GetDevice();
+  // 0: constants (b0); 1, 2: the scaled texture (t0) and the cells (t1); 3: the
+  // destination (u0), each a single-descriptor table.
+  D3D12_ROOT_PARAMETER parameters[4];
+  parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+  parameters[0].Constants.ShaderRegister = 0;
+  parameters[0].Constants.RegisterSpace = 0;
+  parameters[0].Constants.Num32BitValues = sizeof(GlowConstants) / sizeof(uint32_t);
+  parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+  D3D12_DESCRIPTOR_RANGE ranges[3];
+  for (uint32_t i = 0; i < 3; ++i) {
+    ranges[i].RangeType =
+        i < 2 ? D3D12_DESCRIPTOR_RANGE_TYPE_SRV : D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+    ranges[i].NumDescriptors = 1;
+    ranges[i].BaseShaderRegister = i < 2 ? i : 0;
+    ranges[i].RegisterSpace = 0;
+    ranges[i].OffsetInDescriptorsFromTableStart = 0;
+    parameters[1 + i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    parameters[1 + i].DescriptorTable.NumDescriptorRanges = 1;
+    parameters[1 + i].DescriptorTable.pDescriptorRanges = &ranges[i];
+    parameters[1 + i].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+  }
+  D3D12_ROOT_SIGNATURE_DESC root_signature_desc = {};
+  root_signature_desc.NumParameters = UINT(rex::countof(parameters));
+  root_signature_desc.pParameters = parameters;
+  root_signature_desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
+  *(glow_root_signature_.ReleaseAndGetAddressOf()) =
+      ui::d3d12::util::CreateRootSignature(provider, root_signature_desc);
+  if (glow_root_signature_) {
+    *(glow_box_pipeline_.ReleaseAndGetAddressOf()) = ui::d3d12::util::CreateComputePipeline(
+        device, shaders::glow_box_cs, sizeof(shaders::glow_box_cs), glow_root_signature_.Get());
+    *(glow_reconstruct_pipeline_.ReleaseAndGetAddressOf()) =
+        ui::d3d12::util::CreateComputePipeline(device, shaders::glow_reconstruct_cs,
+                                               sizeof(shaders::glow_reconstruct_cs),
+                                               glow_root_signature_.Get());
+  }
+  const bool ok = glow_root_signature_ && glow_box_pipeline_ && glow_reconstruct_pipeline_;
+  std::fprintf(stderr, "REX_GLOW_IMAGE pipelines=%u\n", ok ? 1u : 0u);
+  std::fflush(stderr);
+  if (!ok) {
+    glow_box_pipeline_.Reset();
+    glow_reconstruct_pipeline_.Reset();
+    glow_root_signature_.Reset();
+  }
+  return ok;
+}
+
+bool D3D12TextureCache::IsGlowTypedStoreSupported(DXGI_FORMAT format) {
+  const auto it = glow_typed_store_support_.find(uint32_t(format));
+  if (it != glow_typed_store_support_.end()) {
+    return it->second;
+  }
+  D3D12_FEATURE_DATA_FORMAT_SUPPORT support = {};
+  support.Format = format;
+  const bool supported =
+      SUCCEEDED(command_processor_.GetD3D12Provider().GetDevice()->CheckFeatureSupport(
+          D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support))) &&
+      (support.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE);
+  glow_typed_store_support_.emplace(uint32_t(format), supported);
+  return supported;
+}
+
+uint32_t D3D12TextureCache::AllocateGlowImageDescriptor() {
+  if (bindless_resources_used_) {
+    return command_processor_.RequestPersistentViewBindlessDescriptor();
+  }
+  if (!srv_descriptor_cache_free_.empty()) {
+    const uint32_t descriptor_index = srv_descriptor_cache_free_.back();
+    srv_descriptor_cache_free_.pop_back();
+    return descriptor_index;
+  }
+  const uint32_t cache_pages_needed =
+      (srv_descriptor_cache_allocated_ + kSRVDescriptorCachePageSize) /
+      kSRVDescriptorCachePageSize;
+  if (srv_descriptor_cache_.size() < cache_pages_needed) {
+    D3D12_DESCRIPTOR_HEAP_DESC cache_heap_desc;
+    cache_heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    cache_heap_desc.NumDescriptors = kSRVDescriptorCachePageSize;
+    cache_heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+    cache_heap_desc.NodeMask = 0;
+    while (srv_descriptor_cache_.size() < cache_pages_needed) {
+      Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> cache_heap;
+      if (FAILED(command_processor_.GetD3D12Provider().GetDevice()->CreateDescriptorHeap(
+              &cache_heap_desc, IID_PPV_ARGS(&cache_heap)))) {
+        return UINT32_MAX;
+      }
+      srv_descriptor_cache_.emplace_back(cache_heap.Get());
+    }
+  }
+  return srv_descriptor_cache_allocated_++;
+}
+
+D3D12TextureCache::GlowImage* D3D12TextureCache::PrepareGlowImage(
+    D3D12Texture& texture, uint32_t host_swizzle, const GlowImageRequest& request,
+    const native_resolve::Rect* tracked, size_t tracked_count) {
+  const TextureKey key = texture.key();
+  if (key.dimension != xenos::DataDimension::k2DOrStacked || key.GetDepthOrArraySize() != 1 ||
+      key.mip_max_level != 0 || !EnsureGlowPipelines()) {
+    return nullptr;
+  }
+  const DXGI_FORMAT view_format = GetDXGIUnormFormat(key);
+  if (view_format == DXGI_FORMAT_UNKNOWN ||
+      (request.kind == GlowImageKind::kReconstructed && !IsGlowTypedStoreSupported(view_format))) {
+    return nullptr;
+  }
+  const uint32_t scale_x = draw_resolution_scale_x();
+  const uint32_t scale_y = draw_resolution_scale_y();
+  GlowConstants constants = {};
+  constants.native_size[0] = key.GetWidth();
+  constants.native_size[1] = key.GetHeight();
+  constants.scale[0] = scale_x;
+  constants.scale[1] = scale_y;
+  constants.host_size[0] = key.GetWidth() * scale_x;
+  constants.host_size[1] = key.GetHeight() * scale_y;
+  switch (request.footprint) {
+    case GlowImageFootprint::kRegion:
+      constants.flags = 1;
+      std::memcpy(constants.rects[0], request.region, sizeof(request.region));
+      break;
+    case GlowImageFootprint::kSourceNative:
+      // Oldest first, so the newest containing rectangle wins.
+      constants.rect_count = uint32_t(std::min(tracked_count, size_t(4)));
+      for (uint32_t i = 0; i < constants.rect_count; ++i) {
+        const native_resolve::Rect& rect = tracked[constants.rect_count - 1 - i];
+        constants.rects[i][0] = int32_t(rect.left);
+        constants.rects[i][1] = int32_t(rect.top);
+        constants.rects[i][2] = int32_t(rect.right);
+        constants.rects[i][3] = int32_t(rect.bottom);
+      }
+      break;
+    default:
+      break;
+  }
+  if (REXCVAR_GET(d3d12_debug_glow_image_copy)) constants.flags |= 2;
+  if (REXCVAR_GET(d3d12_debug_glow_image_direct)) constants.flags |= 4;
+
+  GlowImage* image = nullptr;
+  for (const std::unique_ptr<GlowImage>& entry : glow_images_) {
+    if (entry->source == &texture && entry->kind == request.kind &&
+        entry->host_swizzle == host_swizzle) {
+      image = entry.get();
+      break;
+    }
+  }
+  if (!image) {
+    if (glow_images_.size() >= kMaxGlowImages) {
+      // Replace the least recently used image (released after its last use).
+      size_t oldest = 0;
+      for (size_t i = 1; i < glow_images_.size(); ++i) {
+        if (glow_images_[i]->last_used_frame < glow_images_[oldest]->last_used_frame) {
+          oldest = i;
+        }
+      }
+      if (glow_images_[oldest]->last_used_frame == glow_frame_) {
+        return nullptr;  // all in use this frame
+      }
+      ReleaseGlowImage(*glow_images_[oldest], false);
+      glow_images_[oldest] = std::move(glow_images_.back());
+      glow_images_.pop_back();
+    }
+    glow_images_.push_back(std::make_unique<GlowImage>());
+    image = glow_images_.back().get();
+    image->source = &texture;
+    image->kind = request.kind;
+    image->host_swizzle = host_swizzle;
+  }
+
+  ID3D12Device* device = command_processor_.GetD3D12Provider().GetDevice();
+  if (!image->cells || image->view_format != view_format ||
+      image->constants.native_size[0] != constants.native_size[0] ||
+      image->constants.native_size[1] != constants.native_size[1] ||
+      image->constants.scale[0] != scale_x || image->constants.scale[1] != scale_y) {
+    // Own committed memory, zero-initialized (never placed or aliased).
+    ReleaseGlowImage(*image, false);
+    D3D12_RESOURCE_DESC desc = {};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = constants.native_size[0];
+    desc.Height = constants.native_size[1];
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+    desc.SampleDesc.Count = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    if (FAILED(device->CreateCommittedResource(&ui::d3d12::util::kHeapPropertiesDefault,
+                                               D3D12_HEAP_FLAG_NONE, &desc,
+                                               D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+                                               IID_PPV_ARGS(&image->cells)))) {
+      return nullptr;
+    }
+    image->cells_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    if (request.kind == GlowImageKind::kReconstructed) {
+      desc.Width = constants.host_size[0];
+      desc.Height = constants.host_size[1];
+      desc.Format = view_format;
+      if (FAILED(device->CreateCommittedResource(&ui::d3d12::util::kHeapPropertiesDefault,
+                                                 D3D12_HEAP_FLAG_NONE, &desc,
+                                                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+                                                 IID_PPV_ARGS(&image->reconstructed)))) {
+        image->cells.Reset();
+        return nullptr;
+      }
+      image->reconstructed_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    }
+    image->srv_descriptor = AllocateGlowImageDescriptor();
+    if (image->srv_descriptor == UINT32_MAX) {
+      image->cells.Reset();
+      image->reconstructed.Reset();
+      return nullptr;
+    }
+    // The view the title's shader samples: the guest swizzle like the
+    // texture's own view, one layer, one mip.
+    D3D12_SHADER_RESOURCE_VIEW_DESC view = {};
+    view.Format = request.kind == GlowImageKind::kNative ? DXGI_FORMAT_R32G32B32A32_FLOAT
+                                                          : view_format;
+    view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+    view.Shader4ComponentMapping =
+        host_swizzle | D3D12_SHADER_COMPONENT_MAPPING_ALWAYS_SET_BIT_AVOIDING_ZEROMEM_MISTAKES;
+    view.Texture2DArray.MipLevels = 1;
+    view.Texture2DArray.ArraySize = 1;
+    device->CreateShaderResourceView(request.kind == GlowImageKind::kNative
+                                         ? image->cells.Get()
+                                         : image->reconstructed.Get(),
+                                     &view, GetTextureDescriptorCPUHandle(image->srv_descriptor));
+    image->view_format = view_format;
+    image->made = false;
+  }
+
+  if (image->made && image->source_epoch == texture.content_epoch() &&
+      !std::memcmp(&image->constants, &constants, sizeof(constants))) {
+    return image;
+  }
+
+  // Make the image: the scaled texture (already in the shader resource state)
+  // -> cells -> (kReconstructed) the reconstructed image.
+  ui::d3d12::util::DescriptorCpuGpuHandlePair descriptors[4];
+  const bool reconstructed = request.kind == GlowImageKind::kReconstructed;
+  if (!command_processor_.RequestOneUseSingleViewDescriptors(reconstructed ? 4 : 2,
+                                                              descriptors)) {
+    return nullptr;
+  }
+  D3D12_SHADER_RESOURCE_VIEW_DESC source_view = {};
+  source_view.Format = view_format;
+  source_view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+  source_view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+  source_view.Texture2DArray.MipLevels = 1;
+  source_view.Texture2DArray.ArraySize = 1;
+  device->CreateShaderResourceView(texture.resource(), &source_view, descriptors[0].first);
+  D3D12_UNORDERED_ACCESS_VIEW_DESC cells_uav = {};
+  cells_uav.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+  cells_uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+  device->CreateUnorderedAccessView(image->cells.Get(), nullptr, &cells_uav,
+                                    descriptors[1].first);
+
+  DeferredCommandList& command_list = command_processor_.GetDeferredCommandList();
+  // Box pass: unclamped cells for the reconstructed image (it clamps), the
+  // :region= clamp for a native image.
+  GlowConstants box_constants = constants;
+  if (reconstructed) box_constants.flags &= ~UINT32_C(1);
+  command_processor_.PushTransitionBarrier(image->cells.Get(), image->cells_state,
+                                           D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  image->cells_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+  command_processor_.SubmitBarriers();
+  command_processor_.SetExternalPipeline(glow_box_pipeline_.Get());
+  command_list.D3DSetComputeRootSignature(glow_root_signature_.Get());
+  command_list.D3DSetComputeRoot32BitConstants(0, sizeof(GlowConstants) / sizeof(uint32_t),
+                                               &box_constants, 0);
+  command_list.D3DSetComputeRootDescriptorTable(1, descriptors[0].second);
+  command_list.D3DSetComputeRootDescriptorTable(2, descriptors[0].second);
+  command_list.D3DSetComputeRootDescriptorTable(3, descriptors[1].second);
+  command_list.D3DDispatch((constants.native_size[0] + 7) / 8,
+                           (constants.native_size[1] + 7) / 8, 1);
+  const D3D12_RESOURCE_STATES sampled_state =
+      D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+  if (reconstructed) {
+    D3D12_SHADER_RESOURCE_VIEW_DESC cells_view = {};
+    cells_view.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+    cells_view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    cells_view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    cells_view.Texture2D.MipLevels = 1;
+    device->CreateShaderResourceView(image->cells.Get(), &cells_view, descriptors[2].first);
+    D3D12_UNORDERED_ACCESS_VIEW_DESC reconstructed_uav = {};
+    reconstructed_uav.Format = view_format;
+    reconstructed_uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    device->CreateUnorderedAccessView(image->reconstructed.Get(), nullptr, &reconstructed_uav,
+                                      descriptors[3].first);
+    command_processor_.PushTransitionBarrier(image->cells.Get(), image->cells_state,
+                                             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    image->cells_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    command_processor_.PushTransitionBarrier(image->reconstructed.Get(),
+                                             image->reconstructed_state,
+                                             D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    image->reconstructed_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    command_processor_.SubmitBarriers();
+    command_processor_.SetExternalPipeline(glow_reconstruct_pipeline_.Get());
+    command_list.D3DSetComputeRootSignature(glow_root_signature_.Get());
+    command_list.D3DSetComputeRoot32BitConstants(0, sizeof(GlowConstants) / sizeof(uint32_t),
+                                                 &constants, 0);
+    command_list.D3DSetComputeRootDescriptorTable(1, descriptors[0].second);
+    command_list.D3DSetComputeRootDescriptorTable(2, descriptors[2].second);
+    command_list.D3DSetComputeRootDescriptorTable(3, descriptors[3].second);
+    command_list.D3DDispatch((constants.host_size[0] + 7) / 8, (constants.host_size[1] + 7) / 8,
+                             1);
+    command_processor_.PushTransitionBarrier(image->reconstructed.Get(),
+                                             image->reconstructed_state, sampled_state);
+    image->reconstructed_state = sampled_state;
+  } else {
+    command_processor_.PushTransitionBarrier(image->cells.Get(), image->cells_state,
+                                             sampled_state);
+    image->cells_state = sampled_state;
+  }
+  image->constants = constants;
+  image->source_epoch = texture.content_epoch();
+  image->made = true;
+  ++glow_images_made_;
+  if (REXCVAR_GET(d3d12_debug_glow_image_dump) &&
+      (key.base_page << 12) == REXCVAR_GET(d3d12_debug_glow_image_dump) &&
+      glow_frame_ >= REXCVAR_GET(d3d12_debug_glow_image_dump_frame) &&
+      glow_dump_regenerations_ < 8) {
+    ++glow_dump_regenerations_;
+    char prefix[160];
+    std::snprintf(prefix, sizeof(prefix), "glow_f%llu_n%u_%08X_%s_s%ux%u_r%u",
+                  static_cast<unsigned long long>(glow_frame_), glow_dump_regenerations_,
+                  key.base_page << 12, reconstructed ? "reconstructed" : "native", scale_x,
+                  scale_y, constants.rect_count);
+    QueueGlowDump(texture.resource(), sampled_state, view_format, std::string(prefix) + "_source");
+    QueueGlowDump(image->cells.Get(), image->cells_state, DXGI_FORMAT_R32G32B32A32_FLOAT,
+                  std::string(prefix) + "_cells");
+    if (reconstructed) {
+      QueueGlowDump(image->reconstructed.Get(), image->reconstructed_state, view_format,
+                    std::string(prefix) + "_image");
+    }
+    std::string rects;
+    for (uint32_t i = 0; i < constants.rect_count; ++i) {
+      char rect[64];
+      std::snprintf(rect, sizeof(rect), "%s%d,%d,%d,%d", i ? ";" : "", constants.rects[i][0],
+                    constants.rects[i][1], constants.rects[i][2], constants.rects[i][3]);
+      rects += rect;
+    }
+    std::fprintf(stderr, "REX_GLOW_DUMP queued=%s flags=%u rects=%s\n", prefix, constants.flags,
+                 rects.c_str());
+    std::fflush(stderr);
+  }
+  if (glow_images_logged_ < 32) {
+    ++glow_images_logged_;
+    std::fprintf(stderr,
+                 "REX_GLOW_IMAGE made=%llu kind=%s tex=0x%08X size=%ux%u scale=%ux%u "
+                 "format=%u view=%u footprint=%u rects=%u images=%zu\n",
+                 static_cast<unsigned long long>(glow_images_made_),
+                 reconstructed ? "reconstructed" : "native", key.base_page << 12,
+                 constants.native_size[0], constants.native_size[1], scale_x, scale_y,
+                 uint32_t(key.format), uint32_t(view_format), uint32_t(request.footprint),
+                 constants.rect_count, glow_images_.size());
+    std::fflush(stderr);
+  }
+  return image;
+}
+
+void D3D12TextureCache::ReleaseGlowImage(GlowImage& image, bool immediately) {
+  if (immediately) {
+    if (image.srv_descriptor != UINT32_MAX) ReleaseTextureDescriptor(image.srv_descriptor);
+    image.cells.Reset();
+    image.reconstructed.Reset();
+  } else if (image.cells || image.reconstructed || image.srv_descriptor != UINT32_MAX) {
+    // After the last submission that used it.
+    DeferredTextureRelease release;
+    release.submission =
+        std::max(image.last_used_submission, command_processor_.GetCurrentSubmission());
+    release.resource = std::move(image.cells);
+    if (image.srv_descriptor != UINT32_MAX) release.descriptors.push_back(image.srv_descriptor);
+    deferred_texture_releases_.push_back(std::move(release));
+    if (image.reconstructed) {
+      DeferredTextureRelease reconstructed_release;
+      reconstructed_release.submission = deferred_texture_releases_.back().submission;
+      reconstructed_release.resource = std::move(image.reconstructed);
+      deferred_texture_releases_.push_back(std::move(reconstructed_release));
+    }
+  }
+  image.srv_descriptor = UINT32_MAX;
+  image.made = false;
+  for (uint32_t i = 0; i < 32; ++i) {
+    if (glow_image_bound_[i] == &image) {
+      glow_image_bound_[i] = nullptr;
+      glow_image_bound_mask_ &= ~(UINT32_C(1) << i);
+      ++glow_image_binding_generation_;
+    }
+  }
+}
+
+void D3D12TextureCache::ReleaseGlowImages(bool immediately) {
+  for (const std::unique_ptr<GlowImage>& image : glow_images_) {
+    ReleaseGlowImage(*image, immediately);
+  }
+  glow_images_.clear();
+  glow_image_bound_mask_ = 0;
+  std::fill(std::begin(glow_image_bound_), std::end(glow_image_bound_), nullptr);
+  ++glow_image_binding_generation_;
+}
+
+void D3D12TextureCache::QueueGlowDump(ID3D12Resource* resource, D3D12_RESOURCE_STATES state,
+                                      DXGI_FORMAT format, const std::string& name) {
+  if (!resource) return;
+  ID3D12Device* device = command_processor_.GetD3D12Provider().GetDevice();
+  const D3D12_RESOURCE_DESC desc = resource->GetDesc();
+  PendingGlowDump dump;
+  UINT64 total = 0;
+  device->GetCopyableFootprints(&desc, 0, 1, 0, &dump.footprint, &dump.rows, &dump.row_bytes,
+                                &total);
+  D3D12_RESOURCE_DESC buffer_desc;
+  ui::d3d12::util::FillBufferResourceDesc(buffer_desc, total, D3D12_RESOURCE_FLAG_NONE);
+  if (FAILED(device->CreateCommittedResource(&ui::d3d12::util::kHeapPropertiesReadback,
+                                             D3D12_HEAP_FLAG_NONE, &buffer_desc,
+                                             D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                             IID_PPV_ARGS(&dump.readback)))) {
+    return;
+  }
+  command_processor_.PushTransitionBarrier(resource, state, D3D12_RESOURCE_STATE_COPY_SOURCE);
+  command_processor_.SubmitBarriers();
+  D3D12_TEXTURE_COPY_LOCATION destination = {};
+  destination.pResource = dump.readback.Get();
+  destination.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+  destination.PlacedFootprint = dump.footprint;
+  D3D12_TEXTURE_COPY_LOCATION source = {};
+  source.pResource = resource;
+  source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+  source.SubresourceIndex = 0;
+  command_processor_.GetDeferredCommandList().D3DCopyTextureRegion(&destination, 0, 0, 0, &source,
+                                                                   nullptr);
+  command_processor_.PushTransitionBarrier(resource, D3D12_RESOURCE_STATE_COPY_SOURCE, state);
+  command_processor_.SubmitBarriers();
+  dump.submission = command_processor_.GetCurrentSubmission();
+  dump.name = name;
+  dump.format = format;
+  dump.width = uint32_t(desc.Width);
+  dump.height = desc.Height;
+  pending_glow_dumps_.push_back(std::move(dump));
+}
+
+void D3D12TextureCache::ProcessGlowDumps() {
+  const uint64_t completed = command_processor_.GetCompletedSubmission();
+  auto& writer = texture_pack::FileWriter::Get();
+  for (size_t i = 0; i < pending_glow_dumps_.size();) {
+    PendingGlowDump& dump = pending_glow_dumps_[i];
+    if (dump.submission > completed) {
+      ++i;
+      continue;
+    }
+    void* mapping = nullptr;
+    const D3D12_RANGE read_range = {0, SIZE_T(dump.readback->GetDesc().Width)};
+    if (SUCCEEDED(dump.readback->Map(0, &read_range, &mapping))) {
+      std::vector<uint8_t> data;
+      data.reserve(size_t(dump.row_bytes) * dump.rows);
+      const uint8_t* source = static_cast<const uint8_t*>(mapping) + dump.footprint.Offset;
+      for (UINT row = 0; row < dump.rows; ++row) {
+        const uint8_t* row_start = source + size_t(row) * dump.footprint.Footprint.RowPitch;
+        data.insert(data.end(), row_start, row_start + size_t(dump.row_bytes));
+      }
+      const D3D12_RANGE write_range = {};
+      dump.readback->Unmap(0, &write_range);
+      const std::filesystem::path path = TextureDumpFolder() / (dump.name + ".dds");
+      writer.Enqueue(path, texture_pack::BuildDds2D(uint32_t(dump.format), dump.width,
+                                                    dump.height, 1, data));
+      std::fprintf(stderr, "REX_GLOW_DUMP written=%s\n", texture_pack::PathText(path).c_str());
+      std::fflush(stderr);
+    }
+    pending_glow_dumps_[i] = std::move(pending_glow_dumps_.back());
+    pending_glow_dumps_.pop_back();
+  }
+}
+
+void D3D12TextureCache::EvictUnusedGlowImages() {
+  // Images of passes not drawn for about a second (other menus, other modes).
+  for (size_t i = 0; i < glow_images_.size();) {
+    if (glow_images_[i]->last_used_frame + 60 < glow_frame_) {
+      ReleaseGlowImage(*glow_images_[i], false);
+      glow_images_[i] = std::move(glow_images_.back());
+      glow_images_.pop_back();
+    } else {
+      ++i;
+    }
+  }
 }
 
 }  // namespace rex::graphics::d3d12

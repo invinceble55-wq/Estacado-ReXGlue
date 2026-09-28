@@ -142,6 +142,17 @@ class TextureCache {
     return (binding->texture && binding->texture->key().scaled_resolve) ||
            (binding->texture_signed && binding->texture_signed->key().scaled_resolve);
   }
+  // Diagnostics (#16): guest base, size and format of the bound texture.
+  bool GetActiveTextureSummary(uint32_t fetch_constant_index, uint32_t& base_address,
+                               uint32_t& width, uint32_t& height, uint32_t& format) const {
+    const TextureBinding* binding = GetValidTextureBinding(fetch_constant_index);
+    if (!binding) return false;
+    base_address = binding->key.base_page << 12;
+    width = binding->key.GetWidth();
+    height = binding->key.GetHeight();
+    format = uint32_t(binding->key.format);
+    return true;
+  }
 
  protected:
   struct TextureKey {

@@ -65,6 +65,8 @@ REXCVAR_DECLARE(std::string, input_bind_start);
 #include <dxgi1_6.h>
 #include <intrin.h>
 #endif
+#include <rex/graphics/gpu_diagnostics.h>
+#include <rex/graphics/pipeline/render_target/native_shader_scale_policy.h>
 #include <rex/graphics/pipeline/texture/texture_pack.h>
 #include <rex/graphics/pipeline/texture/prompt_icons.h>
 #include <rex/ui/settings_detection.h>
@@ -622,6 +624,15 @@ void EmbeddedSettingsOverlayListener::Open() {
         std::replace(name.begin(), name.end(), '.', '_');
         if (!rex::cvar::GetFlagInfo(name)) return;
         rex::cvar::SetFlagByName(name, value);
+        if (name == "graphics_glow_reconstruction") {
+          // Read at the next swap on the command processor thread (#16).
+          namespace policy = rex::graphics::render_target::native_shader_scale_policy;
+          policy::GlowPolicy glow;
+          if (policy::ParseGlowPolicy(value, glow)) {
+            glow = policy::AvailableGlowPolicy(glow, rex::graphics::kGpuDiagnostics);
+            policy::live_glow_policy.store(uint8_t(glow), std::memory_order_release);
+          }
+        }
         // The presenter keeps its own copy of the present_* values.
         if (name.rfind("present_", 0) == 0 && graphics_ && graphics_->presenter()) {
           graphics_->presenter()->SetGuestOutputPaintConfigFromUIThread(
@@ -1758,7 +1769,7 @@ extern "C" REX_GPU_PLUGIN_EXPORT void* rex_gpu_embedded_create(
       "REX_PC_SETTINGS_EFFECTIVE window_mode=%s output_resolution=%s "
       "window_width=%s window_height=%s monitor=%s resolution_scale=%s "
       "draw_resolution_scale_threshold=%s native_grid_rules=%s "
-      "swap_post_effect=%s anisotropic_override=%s motion_blur=%s "
+      "swap_post_effect=%s anisotropic_override=%s motion_blur=%s glow_reconstruction=%s "
       "letterbox=%s overscan_cutoff=%s safe_area_x=%s safe_area_y=%s "
       "present_mode=%s max_frame_latency=%s low_latency=%s frame_limit=%s frame_rate=%s "
       "vsync_interval=%s gameplay_fov=%s "
@@ -1775,6 +1786,7 @@ extern "C" REX_GPU_PLUGIN_EXPORT void* rex_gpu_embedded_create(
       effective_setting("swap_post_effect").c_str(),
       effective_setting("anisotropic_override").c_str(),
       effective_setting("graphics_motion_blur").c_str(),
+      effective_setting("graphics_glow_reconstruction").c_str(),
       effective_setting("present_letterbox").c_str(),
       effective_setting("present_allow_overscan_cutoff").c_str(),
       effective_setting("present_safe_area_x").c_str(),

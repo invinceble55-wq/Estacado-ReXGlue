@@ -67,6 +67,24 @@ REXCVAR_DEFINE_BOOL(
     "they are left out there, issue #16)")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
+// Live: the in-game overlay sets it by name (graphics.glow_reconstruction).
+REXCVAR_DEFINE_STRING(graphics_glow_reconstruction, "on", "Graphics",
+                      "Glow reconstruction at internal scales above 1x: on (smooth glow: the "
+                      "image-filter rules of draw_resolution_scale_native_grid_rules, the title's "
+                      "own shaders sampling console-size images made in dedicated memory; "
+                      "dedicated is the test builds' name for it) or off (the data rules only: the "
+                      "0.9.0 glow, with banding); diagnostics (builds with GPU diagnostics only): "
+                      "shader (the 0.9.1-0.9.5 reconstruction shader), passes, composites, "
+                      "dedicated_scaled, dedicated_passes, dedicated_reconstructed");
+
+// #16 diagnostics: dedicated glow images only for the draws of these pixel
+// shaders (hexadecimal ucode hashes, comma-separated; empty = every glow draw).
+// The other glow draws sample their textures normally.
+REXCVAR_DEFINE_STRING(d3d12_debug_glow_image_shaders, "", "GPU/D3D12",
+                      "Diagnostics: dedicated glow images only for these pixel shader hashes "
+                      "(hexadecimal, comma-separated; empty: all)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
 REXCVAR_DEFINE_BOOL(d3d12_readback_memexport, false, "GPU/D3D12",
                     "Read data written by memory export in shaders on the CPU")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
@@ -3213,7 +3231,27 @@ bool D3D12CommandProcessor::SetupContext() {
   native_shader_grid_rules_ = native_shader_grid_rules_configured_;
   native_grid_frame_resolved_2x_msaa_ = false;
   native_grid_filters_suspended_ = false;
+  glow_policy_ = render_target::native_shader_scale_policy::GlowPolicy::kOn;
+  glow_policy_applied_ = false;
   native_shader_grid_logged_mask_ = 0;
+  {
+    // The configured policy applies from the first frame; later changes come
+    // from the in-game overlay through live_glow_policy only.
+    namespace policy = render_target::native_shader_scale_policy;
+    policy::GlowPolicy glow = policy::GlowPolicy::kOn;
+    const std::string text = REXCVAR_GET(graphics_glow_reconstruction);
+    if (!policy::ParseGlowPolicy(text, glow)) {
+      std::fprintf(stderr, "REX_GLOW_RECONSTRUCTION invalid=%s kept=on\n", text.c_str());
+      std::fflush(stderr);
+    } else if (policy::AvailableGlowPolicy(glow, kGpuDiagnostics) != glow) {
+      std::fprintf(stderr, "REX_GLOW_RECONSTRUCTION diagnostic=%s unavailable kept=on\n",
+                   text.c_str());
+      std::fflush(stderr);
+      glow = policy::GlowPolicy::kOn;
+    }
+    policy::live_glow_policy.store(uint8_t(glow), std::memory_order_release);
+  }
+  UpdateNativeGridFiltersAtSwap();
   embedded_target_writer_config_ = {
       REXCVAR_GET(embedded_target_writer_surface),
       REXCVAR_GET(embedded_target_writer_color),
@@ -4632,22 +4670,72 @@ bool D3D12CommandProcessor::EnsureSmaaResources(uint32_t width, uint32_t height)
 }
 
 void D3D12CommandProcessor::UpdateNativeGridFiltersAtSwap() {
+  namespace policy = render_target::native_shader_scale_policy;
   const bool suspend = native_grid_frame_resolved_2x_msaa_ &&
                        !REXCVAR_GET(draw_resolution_scale_native_grid_2x_msaa_filters);
   native_grid_frame_resolved_2x_msaa_ = false;
-  if (suspend == native_grid_filters_suspended_) return;
+  const policy::GlowPolicy glow =
+      policy::GlowPolicy(policy::live_glow_policy.load(std::memory_order_acquire));
+  if (glow_policy_applied_ && suspend == native_grid_filters_suspended_ && glow == glow_policy_) {
+    return;
+  }
+  const bool glow_changed = !glow_policy_applied_ || glow != glow_policy_;
+  glow_policy_applied_ = true;
+  glow_policy_ = glow;
   native_grid_filters_suspended_ = suspend;
   native_shader_grid_rules_ =
-      suspend ? render_target::native_shader_scale_policy::WithoutImageFilters(
-                    native_shader_grid_rules_configured_)
-              : native_shader_grid_rules_configured_;
+      policy::EffectiveRules(native_shader_grid_rules_configured_, glow, suspend);
+  if (glow_changed) {
+    std::fprintf(stderr, "REX_GLOW_RECONSTRUCTION policy=%s\n", policy::GlowPolicyName(glow));
+    std::fflush(stderr);
+  }
   static uint32_t logged = 0;
   if (logged < 64 || (logged & 1023) == 0) {
-    std::fprintf(stderr, "REX_NATIVE_GRID_FILTERS active=%u reason=%s changes=%u\n",
-                 suspend ? 0u : 1u, suspend ? "title_2x_msaa" : "title_4x_msaa", logged + 1);
+    const bool active = !suspend && glow != policy::GlowPolicy::kOff;
+    std::fprintf(stderr, "REX_NATIVE_GRID_FILTERS active=%u reason=%s glow=%s changes=%u\n",
+                 active ? 1u : 0u, suspend ? "title_2x_msaa" : "title_4x_msaa",
+                 policy::GlowPolicyName(glow), logged + 1);
     std::fflush(stderr);
   }
   ++logged;
+}
+
+void D3D12CommandProcessor::LogNativeFilterFetch(uint32_t texture_index,
+                                                  const float* region_constants,
+                                                  size_t candidate_count) {
+  static std::unordered_set<uint64_t> logged;
+  if (logged.size() >= 256) return;
+  uint32_t base = 0, width = 0, height = 0, format = 0;
+  const bool bound = texture_cache_->GetActiveTextureSummary(texture_index, base, width,
+                                                             height, format);
+  const bool scaled = texture_cache_->IsActiveTextureResolutionScaled(texture_index);
+  uint64_t key = native_filter_pixel_hash_ ^ (uint64_t(texture_index) << 58) ^
+                 (uint64_t(base) << 20) ^ (uint64_t(width) << 44) ^ (uint64_t(height) << 30) ^
+                 (uint64_t(format) << 8) ^ (scaled ? 0x5A5Aull : 0) ^ uint64_t(candidate_count);
+  for (uint32_t i = 0; i < 4; ++i) {
+    key = key * 0x100000001B3ull ^ uint64_t(int64_t(region_constants[i]));
+  }
+  for (size_t i = 0; i < candidate_count && i < 4; ++i) {
+    for (uint32_t j = 0; j < 4; ++j) {
+      key = key * 0x100000001B3ull ^
+            uint64_t(int64_t(system_constants_.native_filter_candidate_regions[i][j]));
+    }
+  }
+  if (!logged.insert(key).second) return;
+  std::fprintf(stderr,
+               "REX_NATIVE_FILTER_FETCH ps=%016llX fetch=%u bound=%u scaled=%u tex=0x%08X "
+               "size=%ux%u format=%u region=%.0f,%.0f,%.0f,%.0f candidates=%zu",
+               static_cast<unsigned long long>(native_filter_pixel_hash_), texture_index,
+               bound ? 1u : 0u, scaled ? 1u : 0u, base, width, height, format,
+               region_constants[0], region_constants[1], region_constants[2],
+               region_constants[3], candidate_count);
+  for (size_t i = 0; i < candidate_count && i < 4; ++i) {
+    const float* rect = system_constants_.native_filter_candidate_regions[i];
+    std::fprintf(stderr, "%s%.0f,%.0f,%.0f,%.0f", i ? ";" : " rects=", rect[0], rect[1],
+                 rect[2], rect[3]);
+  }
+  std::fprintf(stderr, "\n");
+  std::fflush(stderr);
 }
 
 void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
@@ -5981,6 +6069,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
                     fetch.clamp_y == xenos::ClampMode::kClampToEdge)) continue;
         if (!primary_matched) {
           native_filter_fetch = rule.fetch + 1;
+          native_filter_pixel_hash_ = pixel_shader->ucode_data_hash();
         }
         native_filter_active_ = true;
         float* region = native_filter_fetch_regions_[rule.fetch];
@@ -5995,6 +6084,13 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
           region[3] = float(rule.region_bottom);
         } else {
           native_filter_fetch_modes_[rule.fetch] = NativeFilterFetchMode::kUnbounded;
+        }
+        if (glow_policy_ == render_target::native_shader_scale_policy::GlowPolicy::
+                                kCompositesOnly &&
+            !rule.scaled_filter_output) {
+          // Diagnostics: the native-grid pass keeps its rasterization and
+          // shader variant; its fetch samples normally.
+          native_filter_fetch_modes_[rule.fetch] = NativeFilterFetchMode::kOff;
         }
       }
       const uint32_t msaa_log2 = uint32_t(regs.Get<reg::RB_SURFACE_INFO>().msaa_samples);
@@ -6020,6 +6116,67 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       // A data rule (native rasterization of a table) takes no further rules.
       if (!native_filter_active_) break;
     }
+  }
+  glow_image_mask_ = 0;
+  if (native_filter_active_ &&
+      render_target::native_shader_scale_policy::UsesDedicatedGlowImages(glow_policy_)) {
+    static const std::vector<uint64_t> only_shaders = [] {
+      std::vector<uint64_t> hashes;
+      const std::string text = REXCVAR_GET(d3d12_debug_glow_image_shaders);
+      size_t start = 0;
+      while (start < text.size()) {
+        const size_t end = std::min(text.find(',', start), text.size());
+        if (end > start) {
+          hashes.push_back(std::strtoull(text.substr(start, end - start).c_str(), nullptr, 16));
+        }
+        start = end + 1;
+      }
+      return hashes;
+    }();
+    const bool shader_selected =
+        only_shaders.empty() ||
+        std::find(only_shaders.begin(), only_shaders.end(), pixel_shader->ucode_data_hash()) !=
+            only_shaders.end();
+    // #16: the title's own shader samples dedicated images made from the
+    // scaled textures instead of the reconstruction variant: their box-reduced
+    // native cells (the reconstructed image at the internal resolution only in
+    // the diagnostics dedicated_reconstructed and dedicated_scaled).
+    for (uint32_t i = 0; i < 32; ++i) {
+      if (native_filter_fetch_modes_[i] == NativeFilterFetchMode::kOff) continue;
+      // kDedicatedPasses (diagnostics): images only for the passes drawn on the
+      // native grid; the scaled-output composites sample the texture as it is.
+      if (!shader_selected ||
+          (!native_shader_grid &&
+           glow_policy_ ==
+               render_target::native_shader_scale_policy::GlowPolicy::kDedicatedPasses)) {
+        native_filter_fetch_modes_[i] = NativeFilterFetchMode::kOff;
+        continue;
+      }
+      D3D12TextureCache::GlowImageRequest& request = glow_image_requests_[i];
+      request.kind =
+          (native_shader_grid ||
+           glow_policy_ == render_target::native_shader_scale_policy::GlowPolicy::kOn)
+              ? D3D12TextureCache::GlowImageKind::kNative
+              : D3D12TextureCache::GlowImageKind::kReconstructed;
+      switch (native_filter_fetch_modes_[i]) {
+        case NativeFilterFetchMode::kRegion:
+          request.footprint = D3D12TextureCache::GlowImageFootprint::kRegion;
+          for (uint32_t j = 0; j < 4; ++j) {
+            request.region[j] = int32_t(native_filter_fetch_regions_[i][j]);
+          }
+          break;
+        case NativeFilterFetchMode::kSourceNative:
+          request.footprint = D3D12TextureCache::GlowImageFootprint::kSourceNative;
+          break;
+        default:
+          request.footprint = D3D12TextureCache::GlowImageFootprint::kUnbounded;
+          break;
+      }
+      glow_image_mask_ |= uint32_t(1) << i;
+      native_filter_fetch_modes_[i] = NativeFilterFetchMode::kOff;
+    }
+    native_filter_fetch = 0;
+    native_filter_active_ = false;
   }
   auto scene_update = embedded_scene_update_budget.Begin(
       embedded_completed_swap_ordinal + 1, embedded_frame_frontier.submitted_draws + 1,
@@ -6330,6 +6487,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   const auto texture_request_start =
       record_embedded_timing ? std::chrono::steady_clock::now()
                              : std::chrono::steady_clock::time_point{};
+  texture_cache_->RequestGlowImages(glow_image_mask_, glow_image_requests_);
   texture_cache_->RequestTextures(used_texture_mask);
   if (temporal_aa_enabled_) {
     TemporalAaDraw(vertex_shader->ucode_data_hash(),
@@ -11080,9 +11238,11 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
     dirty |= (texture_signs_uint & texture_signs_mask) != texture_signs_shifted;
     texture_signs_uint = (texture_signs_uint & ~texture_signs_mask) | texture_signs_shifted;
     textures_resolution_scaled |=
-        uint32_t(texture_cache_->IsActiveTextureResolutionScaled(texture_index)) << texture_index;
+        uint32_t(texture_cache_->IsActiveTextureResolutionScaled(texture_index) &&
+                 !texture_cache_->IsActiveTextureNativeGlowImage(texture_index))
+        << texture_index;
     native_resolve::Rect native_region{};
-    if (native_regions_possible) {
+    if (native_regions_possible && !texture_cache_->IsActiveTextureGlowImage(texture_index)) {
       texture_cache_->GetActiveNativeResolveRegion(texture_index, native_region, true);
     }
     float region_constants[4] = {float(native_region.left), float(native_region.top),
@@ -11122,8 +11282,15 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
             dirty = true;
           }
           region_constants[0] = tracked_count ? -2.0f : -1.0f;
+          if (tracked_count) {
+            LogNativeFilterFetch(texture_index, region_constants, tracked_count);
+          }
           break;
         }
+      }
+      if (native_filter_fetch_modes_[texture_index] == NativeFilterFetchMode::kUnbounded ||
+          native_filter_fetch_modes_[texture_index] == NativeFilterFetchMode::kRegion) {
+        LogNativeFilterFetch(texture_index, region_constants, 0);
       }
     }
     if (std::memcmp(system_constants_.native_texture_regions[texture_index], region_constants,
@@ -11567,6 +11734,14 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
   }
 
   assert_true(sampler_count_vertex + sampler_count_pixel <= kSamplerHeapSize);
+
+  // Dedicated glow images (#16) replace texture views without changing the
+  // texture bindings' keys.
+  if (glow_image_binding_generation_ != texture_cache_->glow_image_binding_generation()) {
+    glow_image_binding_generation_ = texture_cache_->glow_image_binding_generation();
+    cbuffer_binding_descriptor_indices_pixel_.up_to_date = false;
+    bindful_textures_written_pixel_ = false;
+  }
 
   if (bindless_resources_used_) {
     //

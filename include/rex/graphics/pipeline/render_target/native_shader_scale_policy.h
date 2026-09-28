@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <charconv>
 #include <cstdint>
 #include <string_view>
@@ -183,6 +184,135 @@ inline Rules WithoutImageFilters(const Rules& rules) {
     if (result.entries[i].image_filter) result.entries[i].width = 0;
   }
   return result;
+}
+
+// The rules without their scaled-output image filters (:filter_scaled, the
+// composites that read a native glow at the internal resolution); native-grid
+// passes and data rules are unchanged.
+inline Rules WithoutScaledOutputFilters(const Rules& rules) {
+  Rules result = rules;
+  for (uint32_t i = 0; i < result.count; ++i) {
+    if (result.entries[i].image_filter && result.entries[i].scaled_filter_output) {
+      result.entries[i].width = 0;
+    }
+  }
+  return result;
+}
+
+// The rules with every image filter drawn at the internal resolution
+// (:filter as :filter_scaled); data rules are unchanged.
+inline Rules WithScaledOutputImageFilters(const Rules& rules) {
+  Rules result = rules;
+  for (uint32_t i = 0; i < result.count; ++i) {
+    if (result.entries[i].image_filter) result.entries[i].scaled_filter_output = true;
+  }
+  return result;
+}
+
+// Glow reconstruction (graphics_glow_reconstruction, #16). kOn (0.9.6, the
+// test builds' "Test A"): the image filters as configured, but the title's own
+// shaders sample images made in dedicated memory (D3D12TextureCache
+// RequestGlowImages): the box-reduced native cells of the scaled textures,
+// console-size images that the hardware filters like the console's (the
+// passes drawn on the native grid and the composites alike). kOff: data rules
+// only (the 0.9.0 glow: native-size glow images sampled at the internal
+// resolution, with banding). Diagnostics (IsGlowDiagnostic; only in builds
+// with GPU diagnostics, see AvailableGlowPolicy): kShader (0.9.1-0.9.5: the
+// reconstruction shader variant in the title's shaders; black dots and
+// flickering squares on some cards), kPassesOnly / kCompositesOnly (kShader
+// for the passes / the composites only), kDedicatedPasses (the composites
+// sample their textures as they are: staircase banding),
+// kDedicatedReconstructed (the composites sample reconstructed images at the
+// internal resolution: a strip at the bottom of the screen in the main menu)
+// and kDedicatedScaled (every image filter at the internal resolution,
+// sampling reconstructed images).
+enum class GlowPolicy : uint8_t {
+  kOn,
+  kOff,
+  kShader,
+  kPassesOnly,
+  kCompositesOnly,
+  kDedicatedScaled,
+  kDedicatedPasses,
+  kDedicatedReconstructed,
+};
+
+inline bool UsesDedicatedGlowImages(GlowPolicy policy) {
+  return policy == GlowPolicy::kOn || policy == GlowPolicy::kDedicatedScaled ||
+         policy == GlowPolicy::kDedicatedPasses || policy == GlowPolicy::kDedicatedReconstructed;
+}
+
+inline bool IsGlowDiagnostic(GlowPolicy policy) {
+  return policy != GlowPolicy::kOn && policy != GlowPolicy::kOff;
+}
+
+// The policy a build runs: diagnostics only with GPU diagnostics compiled in;
+// player builds draw On instead (the reconstruction shader is retired there).
+inline GlowPolicy AvailableGlowPolicy(GlowPolicy policy, bool diagnostics_build) {
+  return diagnostics_build || !IsGlowDiagnostic(policy) ? policy : GlowPolicy::kOn;
+}
+
+inline bool ParseGlowPolicy(std::string_view text, GlowPolicy& policy) {
+  // "dedicated": Test A of the #16 test builds, now On.
+  if (text.empty() || text == "on" || text == "dedicated") {
+    policy = GlowPolicy::kOn;
+  } else if (text == "off") {
+    policy = GlowPolicy::kOff;
+  } else if (text == "shader") {
+    policy = GlowPolicy::kShader;
+  } else if (text == "passes") {
+    policy = GlowPolicy::kPassesOnly;
+  } else if (text == "composites") {
+    policy = GlowPolicy::kCompositesOnly;
+  } else if (text == "dedicated_scaled") {
+    policy = GlowPolicy::kDedicatedScaled;
+  } else if (text == "dedicated_passes") {
+    policy = GlowPolicy::kDedicatedPasses;
+  } else if (text == "dedicated_reconstructed") {
+    policy = GlowPolicy::kDedicatedReconstructed;
+  } else {
+    return false;
+  }
+  return true;
+}
+
+inline const char* GlowPolicyName(GlowPolicy policy) {
+  switch (policy) {
+    case GlowPolicy::kOn:
+      return "on";
+    case GlowPolicy::kOff:
+      return "off";
+    case GlowPolicy::kShader:
+      return "shader";
+    case GlowPolicy::kPassesOnly:
+      return "passes";
+    case GlowPolicy::kCompositesOnly:
+      return "composites";
+    case GlowPolicy::kDedicatedScaled:
+      return "dedicated_scaled";
+    case GlowPolicy::kDedicatedPasses:
+      return "dedicated_passes";
+    case GlowPolicy::kDedicatedReconstructed:
+      return "dedicated_reconstructed";
+  }
+  return "on";
+}
+
+// The policy in effect: written once from the cvar at startup and by the
+// in-game overlay (UI thread), read at every swap (command processor thread).
+inline std::atomic<uint8_t> live_glow_policy{uint8_t(GlowPolicy::kOn)};
+
+// The rules a frame uses: kOff (or a frame the title renders with 2x MSAA, see
+// WithoutImageFilters) keeps the data rules only; kPassesOnly drops the
+// composites. Every rule keeps its index.
+inline Rules EffectiveRules(const Rules& configured, GlowPolicy policy,
+                            bool image_filters_suspended) {
+  if (image_filters_suspended || policy == GlowPolicy::kOff) {
+    return WithoutImageFilters(configured);
+  }
+  if (policy == GlowPolicy::kPassesOnly) return WithoutScaledOutputFilters(configured);
+  if (policy == GlowPolicy::kDedicatedScaled) return WithScaledOutputImageFilters(configured);
+  return configured;
 }
 
 inline bool RequiresNativeRasterization(const Rule& rule, uint32_t msaa_log2) {

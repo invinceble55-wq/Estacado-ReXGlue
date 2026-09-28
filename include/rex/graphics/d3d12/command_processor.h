@@ -683,7 +683,24 @@ class D3D12CommandProcessor : public CommandProcessor {
   render_target::native_shader_scale_policy::Rules native_shader_grid_rules_configured_;
   bool native_grid_frame_resolved_2x_msaa_ = false;
   bool native_grid_filters_suspended_ = false;
+  // graphics_glow_reconstruction, read at every swap (the in-game overlay sets
+  // the cvar while the game runs).
+  render_target::native_shader_scale_policy::GlowPolicy glow_policy_ =
+      render_target::native_shader_scale_policy::GlowPolicy::kOn;
+  bool glow_policy_applied_ = false;
   void UpdateNativeGridFiltersAtSwap();
+  // Diagnostics (#16): every distinct reconstructed fetch (pixel shader,
+  // fetch, mode, bound texture, region) logged once, at most 256.
+  uint64_t native_filter_pixel_hash_ = 0;
+  void LogNativeFilterFetch(uint32_t texture_index, const float* region_constants,
+                            size_t candidate_count);
+  // Dedicated glow images (graphics_glow_reconstruction "dedicated"): the
+  // current draw's requests (set with the rules, passed to the texture cache
+  // right before RequestTextures), and the texture cache's binding generation
+  // the current descriptor indices were written for.
+  uint32_t glow_image_mask_ = 0;
+  D3D12TextureCache::GlowImageRequest glow_image_requests_[32];
+  uint64_t glow_image_binding_generation_ = UINT64_MAX;
   // Footprint reconstruction per fetch for the current draw's matched image
   // filter rules. A filter variant compiles the reconstruction for every 2D
   // fetch; each one's region constant selects at runtime: kOff samples

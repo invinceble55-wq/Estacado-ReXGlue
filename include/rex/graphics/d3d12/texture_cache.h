@@ -127,6 +127,43 @@ class D3D12TextureCache final : public TextureCache {
                                     D3D12_CPU_DESCRIPTOR_HANDLE handle);
   uint32_t GetActiveTextureBindlessSRVIndex(const D3D12Shader::TextureBinding& host_shader_binding);
 
+  // Glow reconstruction with dedicated images (#16, graphics_glow_reconstruction
+  // "dedicated"): for the fetches of the next RequestTextures only, a
+  // resolution-scaled texture is replaced by an image made from it in its own
+  // committed, zero-initialized memory (never placed or aliased with the
+  // scaled resolve memory or other textures), with explicit transitions:
+  // kNative, its box-reduced native cells at the guest size (for a pass
+  // rasterized on the native grid); kReconstructed, the native bilinear of
+  // those cells at every host texel (for a scaled output). The title's own
+  // shaders then sample them; the reconstruction shader variant is not used.
+  enum class GlowImageKind : uint8_t { kNative, kReconstructed };
+  enum class GlowImageFootprint : uint8_t { kUnbounded, kRegion, kSourceNative };
+  struct GlowImageRequest {
+    GlowImageKind kind = GlowImageKind::kNative;
+    GlowImageFootprint footprint = GlowImageFootprint::kUnbounded;
+    // kRegion: native texels [left, top, right, bottom).
+    int32_t region[4] = {};
+  };
+  void RequestGlowImages(uint32_t fetch_mask, const GlowImageRequest* requests) {
+    glow_image_request_mask_ = fetch_mask;
+    // Called for every draw: nothing to copy for the draws without glow.
+    if (!fetch_mask) return;
+    for (uint32_t i = 0; i < 32; ++i) {
+      if (fetch_mask & (UINT32_C(1) << i)) glow_image_requests_[i] = requests[i];
+    }
+  }
+  // As of the latest RequestTextures.
+  bool IsActiveTextureGlowImage(uint32_t fetch_constant_index) const {
+    return (glow_image_bound_mask_ >> fetch_constant_index) & 1;
+  }
+  bool IsActiveTextureNativeGlowImage(uint32_t fetch_constant_index) const {
+    return IsActiveTextureGlowImage(fetch_constant_index) &&
+           glow_image_bound_[fetch_constant_index]->kind == GlowImageKind::kNative;
+  }
+  // Changes whenever the set of bound glow images changes (descriptor
+  // indices written for an earlier draw are then stale).
+  uint64_t glow_image_binding_generation() const { return glow_image_binding_generation_; }
+
   SamplerParameters GetSamplerParameters(const D3D12Shader::SamplerBinding& binding) const;
   void WriteSampler(SamplerParameters parameters, D3D12_CPU_DESCRIPTOR_HANDLE handle) const;
 
@@ -415,7 +452,13 @@ class D3D12TextureCache final : public TextureCache {
       heap_size_ = size;
     }
 
+    // Incremented by every load of the texture's data (dedicated glow images
+    // made from it are then stale).
+    uint64_t content_epoch() const { return content_epoch_; }
+    void BumpContentEpoch() { ++content_epoch_; }
+
    private:
+    uint64_t content_epoch_ = 0;
     Microsoft::WRL::ComPtr<ID3D12Resource> resource_;
     D3D12_RESOURCE_STATES resource_state_;
     int32_t heap_index_ = -1;
@@ -769,6 +812,87 @@ class D3D12TextureCache final : public TextureCache {
   std::vector<std::unique_ptr<TextureHeap>> texture_heaps_;
   uint64_t texture_heap_placed_ = 0;
   uint64_t texture_heap_fallbacks_ = 0;
+  // #16 diagnostic (d3d12_debug_poison_scaled_resolve): 0xFF source for new
+  // scaled-resolve heaps.
+  Microsoft::WRL::ComPtr<ID3D12Resource> debug_poison_upload_buffer_;
+  uint32_t debug_poisoned_heaps_ = 0;
+  void PoisonScaledResolveHeap(uint32_t heap_index, size_t buffer_index);
+
+  // Dedicated glow images (RequestGlowImages).
+  struct GlowConstants {
+    uint32_t native_size[2];
+    uint32_t scale[2];
+    uint32_t host_size[2];
+    uint32_t rect_count;
+    // Bit 0: rects[0] clamps every texel (:region=).
+    uint32_t flags;
+    int32_t rects[4][4];
+  };
+  struct GlowImage {
+    const D3D12Texture* source = nullptr;
+    uint64_t source_epoch = 0;
+    GlowImageKind kind = GlowImageKind::kNative;
+    uint32_t host_swizzle = 0;
+    DXGI_FORMAT view_format = DXGI_FORMAT_UNKNOWN;
+    GlowConstants constants = {};
+    bool made = false;
+    // R32G32B32A32_FLOAT box-reduced cells at the guest size.
+    Microsoft::WRL::ComPtr<ID3D12Resource> cells;
+    D3D12_RESOURCE_STATES cells_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    // kReconstructed: the texture's view format at the host size.
+    Microsoft::WRL::ComPtr<ID3D12Resource> reconstructed;
+    D3D12_RESOURCE_STATES reconstructed_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    // The bound view (bindless index or bindful cache index), host swizzle.
+    uint32_t srv_descriptor = UINT32_MAX;
+    uint64_t last_used_submission = 0;
+    uint64_t last_used_frame = 0;
+  };
+  static constexpr size_t kMaxGlowImages = 16;
+  bool EnsureGlowPipelines();
+  bool IsGlowTypedStoreSupported(DXGI_FORMAT format);
+  uint32_t AllocateGlowImageDescriptor();
+  GlowImage* PrepareGlowImage(D3D12Texture& texture, uint32_t host_swizzle,
+                              const GlowImageRequest& request,
+                              const native_resolve::Rect* tracked, size_t tracked_count);
+  // Releases once the GPU has completed the image's last use (all = also the
+  // ones still in use, for ClearCache with the GPU idle and destruction).
+  void ReleaseGlowImage(GlowImage& image, bool immediately);
+  void ReleaseGlowImages(bool immediately);
+  void EvictUnusedGlowImages();
+  std::vector<std::unique_ptr<GlowImage>> glow_images_;
+  uint32_t glow_image_request_mask_ = 0;
+  GlowImageRequest glow_image_requests_[32];
+  uint32_t glow_image_bound_mask_ = 0;
+  GlowImage* glow_image_bound_[32] = {};
+  uint32_t glow_image_bound_descriptors_[32] = {};
+  uint64_t glow_image_binding_generation_ = 0;
+  uint64_t glow_frame_ = 0;
+  uint64_t glow_images_made_ = 0;
+  uint32_t glow_images_logged_ = 0;
+  Microsoft::WRL::ComPtr<ID3D12RootSignature> glow_root_signature_;
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> glow_box_pipeline_;
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> glow_reconstruct_pipeline_;
+  bool glow_pipelines_attempted_ = false;
+  std::unordered_map<uint32_t, bool> glow_typed_store_support_;
+  // #16 diagnostics (d3d12_debug_glow_image_dump): read back the source
+  // texture, the cells and the image of chosen glow image regenerations and
+  // write them as DDS files to the texture dump folder.
+  struct PendingGlowDump {
+    uint64_t submission = 0;
+    std::string name;
+    Microsoft::WRL::ComPtr<ID3D12Resource> readback;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint = {};
+    UINT rows = 0;
+    UINT64 row_bytes = 0;
+    DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+    uint32_t width = 0;
+    uint32_t height = 0;
+  };
+  std::vector<PendingGlowDump> pending_glow_dumps_;
+  uint32_t glow_dump_regenerations_ = 0;
+  void QueueGlowDump(ID3D12Resource* resource, D3D12_RESOURCE_STATES state,
+                     DXGI_FORMAT format, const std::string& name);
+  void ProcessGlowDumps();
 
   Microsoft::WRL::ComPtr<ID3D12RootSignature> load_root_signature_;
   std::array<Microsoft::WRL::ComPtr<ID3D12PipelineState>, kLoadShaderCount> load_pipelines_;
