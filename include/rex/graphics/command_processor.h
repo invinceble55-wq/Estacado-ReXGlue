@@ -413,6 +413,8 @@ class CommandProcessor {
   uint64_t guest_frame_last_tick_ = 0;
   std::atomic<uint64_t> guest_frame_time_us_{0};
   std::atomic<uint64_t> guest_frame_count_{0};
+  // The current swap's host frame tag (0 = none; VR, openxr_screen.h).
+  uint32_t swap_frame_tag_ = 0;
 
   uint32_t primary_buffer_ptr_ = 0;
   uint32_t primary_buffer_size_ = 0;

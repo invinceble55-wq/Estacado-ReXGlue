@@ -268,6 +268,42 @@ inline UpscalerRuntimes ScanUpscalerRuntimes(const std::filesystem::path& folder
 // current choice that cannot run stays listed, marked: the game uses TAA.
 inline void DetectUpscalers(PanelModel& model, const UpscalerRuntimes& runtimes) {
   if (!model.schema) return;
+  // #3 Frame Generation (experimental): NVIDIA RTX cards only; elsewhere
+  // only Off (a saved choice stays listed, marked).
+  if (const Setting* generation = model.schema->Find("streamline.frame_generation");
+      generation && !runtimes.dlss_card) {
+    const std::string key = "streamline.frame_generation";
+    const std::string current = ValueOf(model, key);
+    std::vector<Choice> choices;
+    for (Choice choice : generation->choices) {
+      if (choice.value != "0") {
+        if (choice.value != current) continue;
+        choice.label += Translate(model.schema, " - needs an NVIDIA RTX card, off");
+      }
+      choices.push_back(std::move(choice));
+    }
+    model.detected_choices[key] = std::move(choices);
+  }
+  // The temporal upscaler: the same runtimes and card check; a current
+  // choice that cannot run stays listed, marked (the game runs as with Off).
+  if (const Setting* upscaler = model.schema->Find("graphics.upscaler")) {
+    const std::string key = "graphics.upscaler";
+    const std::string current = ValueOf(model, key);
+    std::vector<Choice> choices;
+    for (Choice choice : upscaler->choices) {
+      const bool missing = (choice.value == "dlss" && !runtimes.dlss) ||
+                           (choice.value == "fsr" && !runtimes.fsr) ||
+                           (choice.value == "xess" && !runtimes.xess);
+      const bool no_card = choice.value == "dlss" && runtimes.dlss && !runtimes.dlss_card;
+      if (missing || no_card) {
+        if (choice.value != current) continue;
+        choice.label += Translate(model.schema, no_card ? " - needs an NVIDIA RTX card, off"
+                                                        : " - not installed, off");
+      }
+      choices.push_back(std::move(choice));
+    }
+    model.detected_choices[key] = std::move(choices);
+  }
   const Setting* setting = model.schema->Find(kTemporalAaKey);
   if (!setting) return;
   const std::string key(kTemporalAaKey);

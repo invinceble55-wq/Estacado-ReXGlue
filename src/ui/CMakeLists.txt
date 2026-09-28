@@ -66,6 +66,7 @@ if(REXGLUE_USE_D3D12)
         d3d12/d3d12_util.cpp
         d3d12/streamline_bridge.cpp
         d3d12/streamline_signature.cpp
+        d3d12/openxr_screen.cpp
     )
 endif()
 
@@ -179,6 +180,19 @@ if(REXGLUE_USE_D3D12)
     else()
         target_compile_definitions(rexui PRIVATE REX_HAVE_STREAMLINE=0)
         message(STATUS "  Streamline SDK: not found (${REXGLUE_STREAMLINE_SDK_DIR})")
+    endif()
+    # Experimental VR stage 1 (docs/VR_PLAN.md): OpenXR headers only, the
+    # loader DLL is loaded at run time. Off unless a tree opts in, so player
+    # builds never carry it.
+    option(REXGLUE_ENABLE_OPENXR "Experimental OpenXR screen (VR stage 1)" OFF)
+    set(REXGLUE_OPENXR_SDK_DIR "${REXGLUE_ROOT}/../../build/deps/OpenXR-SDK-1.1.63" CACHE PATH
+        "Khronos OpenXR SDK root (include/openxr)")
+    if(WIN32 AND REXGLUE_ENABLE_OPENXR AND EXISTS "${REXGLUE_OPENXR_SDK_DIR}/include/openxr/openxr.h")
+        target_include_directories(rexui SYSTEM PRIVATE "${REXGLUE_OPENXR_SDK_DIR}/include")
+        target_compile_definitions(rexui PRIVATE REX_HAVE_OPENXR=1)
+        message(STATUS "  OpenXR SDK: ${REXGLUE_OPENXR_SDK_DIR}")
+    else()
+        target_compile_definitions(rexui PRIVATE REX_HAVE_OPENXR=0)
     endif()
 endif()
 

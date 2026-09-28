@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <deque>
 #include <functional>
@@ -943,6 +944,25 @@ class D3D12CommandProcessor : public CommandProcessor {
   // colour untouched): each resolved frame's motion vectors and a typed
   // depth copy go into a ring slot that stays unchanged until its present.
   bool temporal_aa_motion_only_ = false;
+  // VR (experimental): only the HUD-less capture for the eye images.
+  bool temporal_aa_vr_only_ = false;
+  // VR stereo: this frame's eye transform on the scene draws' camera rows.
+  bool temporal_vr_stereo_ = false;
+  bool temporal_vr_draw_ = false;
+  // Whether the bound vertex float constants carry the eye transform.
+  bool temporal_vr_constants_ = false;
+  uint64_t temporal_vr_uploads_ = 0;
+  uint64_t temporal_vr_draws_ = 0;
+  uint32_t temporal_vr_eye_ = 0;
+  uint32_t temporal_vr_tag_ = 0;
+  uint32_t temporal_vr_finished_tag_ = 0;
+  double temporal_vr_clip_[16] = {};
+  // The title's projection: x scale, y scale, z scale, z offset.
+  double temporal_vr_projection_[4] = {};
+  bool temporal_vr_projection_valid_ = false;
+  double temporal_vr_forward_[3] = {};
+  void TemporalVrNextFrame();
+  void TemporalVrRewriteCamera(float* rows) const;
   static constexpr uint32_t kFrameGenerationInputSlots = 4;
   struct FrameGenerationInputSlot {
     Microsoft::WRL::ComPtr<ID3D12Resource> depth;
@@ -988,12 +1008,62 @@ class D3D12CommandProcessor : public CommandProcessor {
   bool TemporalAaResolve();
   bool TemporalAaEnsureResources(uint32_t width, uint32_t height);
   bool TemporalAaUpscalerInitialize(uint32_t kind);
-  bool TemporalAaUpscalerEnsure(uint32_t width, uint32_t height);
+  bool TemporalAaUpscalerEnsure(uint32_t width, uint32_t height, uint32_t out_width = 0,
+                                uint32_t out_height = 0, bool ldr = false);
   // Runs on the thread that executes the deferred command stream.
   static void TemporalAaUpscalerEvaluate(const void* payload,
                                          ID3D12GraphicsCommandList* command_list);
   // After a deferred ExternalCall: nothing bound on the command list is known.
   void InvalidateCommandListStateAfterExternalCall();
+
+  // Temporal upscaling of the finished frame (graphics_upscale_mode, #3 and
+  // #23; command_processor_temporal_aa.cpp): the scene is rendered jittered
+  // at the internal scale; at the final composite its motion vectors and
+  // depth go into the Frame Generation input ring, and right after the
+  // composite's draw a copy of its render target is kept (the frame without
+  // the HUD). At the swap the upscaler (DLSS / FSR 3.1 / XeSS) enlarges that
+  // copy to the output size, the HUD is taken from the finished frame where
+  // it differs, and the result replaces the frontbuffer.
+  struct TemporalUpscale {
+    double ratio = 1.0;
+    // The upscaler could not run: the frame is drawn as without the setting.
+    bool failed = false;
+    bool capture_pending = false;
+    bool frame_valid = false;
+    uint32_t slot = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    float jitter[2] = {};
+    float fov_y = 1.0f;
+    bool reset = true;
+    Microsoft::WRL::ComPtr<ID3D12Resource> hudless;
+    DXGI_FORMAT hudless_view_format = DXGI_FORMAT_UNKNOWN;
+    Microsoft::WRL::ComPtr<ID3D12Resource> color;
+    Microsoft::WRL::ComPtr<ID3D12Resource> upscaled;
+    Microsoft::WRL::ComPtr<ID3D12Resource> output;
+    DXGI_FORMAT output_format = DXGI_FORMAT_UNKNOWN;
+    uint64_t textures_submission = 0;
+    std::chrono::steady_clock::time_point last{};
+    uint64_t frames = 0;
+    uint64_t skipped = 0;
+  };
+  std::unique_ptr<TemporalUpscale> temporal_upscale_;
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> temporal_upscale_prepare_pipeline_;
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> temporal_upscale_composite_pipeline_;
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> temporal_vr_hud_pipeline_;
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> temporal_vr_preview_pipeline_;
+  bool TemporalVrAtSwap(ID3D12Resource*& swap_texture,
+                        D3D12_SHADER_RESOURCE_VIEW_DESC& swap_texture_srv, uint32_t& width,
+                        uint32_t& height);
+  bool TemporalUpscaleAtComposite(const D3D12TextureCache::TemporalAaTexture& color,
+                                  const D3D12TextureCache::TemporalAaTexture& depth,
+                                  const temporal_aa::Camera& camera);
+  void TemporalUpscaleCaptureHudless();
+  // Replaces the swap's source (resource, view, size) with the upscaled frame;
+  // false leaves them unchanged.
+  bool TemporalUpscaleAtSwap(ID3D12Resource*& swap_texture,
+                             D3D12_SHADER_RESOURCE_VIEW_DESC& swap_texture_srv,
+                             uint32_t& width, uint32_t& height);
 
   // Unsubmitted barrier batch.
   std::vector<D3D12_RESOURCE_BARRIER> barriers_;

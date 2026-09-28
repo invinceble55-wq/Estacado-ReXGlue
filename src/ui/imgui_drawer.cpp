@@ -20,6 +20,7 @@
 #include <rex/logging.h>
 #include <rex/ui/imgui_dialog.h>
 #include <rex/ui/imgui_drawer.h>
+#include <rex/ui/d3d12/openxr_screen.h>
 #include <rex/ui/ui_event.h>
 #include <rex/ui/window.h>
 
@@ -372,6 +373,7 @@ void ImGuiDrawer::Draw(UIDrawContext& ui_draw_context) {
   SetupFontTexture();
 
   if (dialogs_.empty()) {
+    d3d12::openxr_screen::SetOverlayVisible(false);
     return;
   }
 
@@ -392,6 +394,22 @@ void ImGuiDrawer::Draw(UIDrawContext& ui_draw_context) {
   float physical_to_logical = float(window_->GetMediumDpi()) / float(window_->GetDpi());
   io.DisplaySize.x = window_->GetActualPhysicalWidth() * physical_to_logical;
   io.DisplaySize.y = window_->GetActualPhysicalHeight() * physical_to_logical;
+
+  // VR (experimental): the overlay is shown in the headset as a screen; the
+  // right hand's laser pointer is the mouse there.
+  d3d12::openxr_screen::SetOverlayVisible(true);
+  {
+    float u = 0.0f, v = 0.0f;
+    bool pressed = false;
+    if (d3d12::openxr_screen::Pointer(u, v, pressed)) {
+      io.MouseDrawCursor = true;
+      io.AddMousePosEvent(u * io.DisplaySize.x, v * io.DisplaySize.y);
+      if (pressed != vr_pointer_pressed_) {
+        io.AddMouseButtonEvent(0, pressed);
+        vr_pointer_pressed_ = pressed;
+      }
+    }
+  }
 
   ImGui::NewFrame();
 

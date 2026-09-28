@@ -27,6 +27,7 @@
 #include <rex/ui/d3d12/d3d12_present_policy.h>
 #include <rex/ui/d3d12/d3d12_provider.h>
 #include <rex/ui/d3d12/d3d12_util.h>
+#include <rex/ui/d3d12/openxr_screen.h>
 #include <rex/ui/d3d12/streamline_bridge.h>
 #include <rex/ui/frame_latency.h>
 #include <rex/ui/guest_frame_limiter.h>
@@ -97,6 +98,7 @@ D3D12Presenter::~D3D12Presenter() {
   // From most likely the latest to most likely the earliest to be signaled, so
   // just one sleep will likely be needed.
   paint_context_.AwaitSwapChainUsageCompletion();
+  openxr_screen::Shutdown();
   guest_output_resource_refresher_submission_tracker_.Shutdown();
   ui_submission_tracker_.Shutdown();
 #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
@@ -1249,6 +1251,31 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
     ExecuteUIDrawersFromUIThread(ui_draw_context);
   }
 
+  // VR (experimental, display_vr): the eye and HUD images into the
+  // headset's, or the finished image, HUD included, into its screen layer
+  // (openxr_screen.h).
+  ID3D12Resource* vr_image = openxr_screen::BeginFrame(
+      provider_.GetDevice(), provider_.GetDirectQueue(), paint_context_.swap_chain_width,
+      paint_context_.swap_chain_height, command_list);
+  if (vr_image) {
+    D3D12_RESOURCE_BARRIER vr_barriers[2] = {};
+    for (D3D12_RESOURCE_BARRIER& barrier : vr_barriers) {
+      barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+      barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    }
+    vr_barriers[0].Transition.pResource = back_buffer;
+    vr_barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    vr_barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    vr_barriers[1].Transition.pResource = vr_image;
+    vr_barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    vr_barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+    command_list->ResourceBarrier(2, vr_barriers);
+    command_list->CopyResource(vr_image, back_buffer);
+    std::swap(vr_barriers[0].Transition.StateBefore, vr_barriers[0].Transition.StateAfter);
+    std::swap(vr_barriers[1].Transition.StateBefore, vr_barriers[1].Transition.StateAfter);
+    command_list->ResourceBarrier(2, vr_barriers);
+  }
+
   // End drawing to the back buffer.
   D3D12_RESOURCE_BARRIER barrier_rtv_to_present;
   barrier_rtv_to_present.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -1274,6 +1301,7 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
   command_list->Close();
   ID3D12CommandList* execute_command_list = command_list;
   provider_.GetDirectQueue()->ExecuteCommandLists(1, &execute_command_list);
+  openxr_screen::EndFrame(vr_image != nullptr);
   if (execute_ui_drawers) {
     ui_submission_tracker_.NextSubmission();
   }

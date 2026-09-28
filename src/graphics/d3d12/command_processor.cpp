@@ -5094,6 +5094,11 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
     std::fflush(stderr);
   }
 
+  // Temporal upscaling: the upscaled frame replaces the frontbuffer.
+  if (temporal_upscale_) {
+    TemporalUpscaleAtSwap(swap_texture_resource, swap_texture_srv_desc, guest_output_width,
+                          guest_output_height);
+  }
   const bool refresh_succeeded = presenter->RefreshGuestOutput(
       guest_output_width, guest_output_height, display_width, display_height,
       [this, &swap_texture_srv_desc, frontbuffer_format, swap_texture_resource, guest_output_width,
@@ -8529,6 +8534,8 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       submission_guest_draws_ < guest_draw_submit_limit_) {
     ++submission_guest_draws_;
   }
+  // Temporal upscaling: the frame right after the final composite (no HUD).
+  if (temporal_upscale_ && temporal_upscale_->capture_pending) TemporalUpscaleCaptureHudless();
 
   // Immediately after the actual draw, before optional diagnostic passes can
   // reuse bindings. Copy the upload already bound by UpdateBindings; no GPU
@@ -10905,11 +10912,11 @@ void D3D12CommandProcessor::UpdateFixedFunctionState(
   viewport.Height = float(viewport_info.xy_extent[1]);
   viewport.MinDepth = viewport_info.z_min;
   viewport.MaxDepth = viewport_info.z_max;
-  if (temporal_aa_jitter_draw_) {
-    // Temporal AA: sub-pixel offset of the scene draws (host pixels).
-    viewport.TopLeftX += temporal_aa_jitter_[0];
-    viewport.TopLeftY += temporal_aa_jitter_[1];
-  }
+  // (Temporal AA / upscaling jitter is a clip-space offset in the system
+  // constants, UpdateSystemConstantValues: moving the viewport left the last
+  // pixel row and column uncovered, keeping stale render target content
+  // there, which the upscalers smeared into bright streaks along the right
+  // and bottom edges of the title menu - 2026-10-12, owner's report.)
   SetViewport(viewport);
 
   // Scissor.
@@ -11177,6 +11184,13 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
               : 1.0f;
       ndc_offset[2] += polygon_offset * host_depth_per_guest_depth / host_depth_range;
     }
+  }
+  // Temporal AA / upscaling: the sub-pixel jitter of the scene draws (host
+  // pixels) as an NDC offset (applied times w, so a whole-screen shift); the
+  // viewport stays put, so primitives still cover every edge pixel.
+  if (temporal_aa_jitter_draw_ && viewport_info.xy_extent[0] && viewport_info.xy_extent[1]) {
+    ndc_offset[0] += 2.0f * temporal_aa_jitter_[0] / float(viewport_info.xy_extent[0]);
+    ndc_offset[1] -= 2.0f * temporal_aa_jitter_[1] / float(viewport_info.xy_extent[1]);
   }
   for (uint32_t i = 0; i < 3; ++i) {
     dirty |= system_constants_.ndc_scale[i] != viewport_info.ndc_scale[i];
@@ -11568,6 +11582,10 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
     cbuffer_binding_system_.up_to_date = true;
     current_graphics_root_up_to_date_ &= ~(1u << root_parameter_system_constants);
   }
+  // VR stereo: a draw that needs the eye transform (or no longer does) needs
+  // its own copy of the constants.
+  const bool vr_constants = temporal_vr_draw_ && (float_constant_map_vertex.float_bitmap[0] & 0xF) == 0xF;
+  if (vr_constants != temporal_vr_constants_) cbuffer_binding_float_vertex_.up_to_date = false;
   if (!cbuffer_binding_float_vertex_.up_to_date) {
     // Even if the shader doesn't need any float constants, a valid binding must
     // still be provided, so if the first draw in the frame with the current
@@ -11595,6 +11613,10 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
         float_constants += 4 * sizeof(float);
       }
     }
+    // c0..c3 are the first four packed constants when all four are used.
+    if (vr_constants) ++temporal_vr_uploads_;
+    if (vr_constants) TemporalVrRewriteCamera(reinterpret_cast<float*>(const_cast<uint8_t*>(embedded_float_vertex_cpu_address_)));
+    temporal_vr_constants_ = vr_constants;
     cbuffer_binding_float_vertex_.up_to_date = true;
     current_graphics_root_up_to_date_ &= ~(1u << root_parameter_float_constants_vertex);
   }

@@ -123,6 +123,8 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
 
   double frame_time_tick_frequency_;
   uint64_t last_frame_time_ticks_;
+  // VR laser pointer (openxr_screen.h): the trigger as the left mouse button.
+  bool vr_pointer_pressed_ = false;
 };
 
 }  // namespace ui

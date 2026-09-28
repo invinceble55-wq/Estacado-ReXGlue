@@ -1167,6 +1167,50 @@ bool D3D12RenderTargetCache::QueueEmbeddedColorTarget(
   return true;
 }
 
+bool D3D12RenderTargetCache::BoundColorTarget0Format(DXGI_FORMAT& resource_format,
+                                                     DXGI_FORMAT& view_format, uint32_t& width,
+                                                     uint32_t& height) const {
+  if (path_ != Path::kHostRenderTargets) return false;
+  auto* target = static_cast<D3D12RenderTarget*>(last_update_accumulated_render_targets()[1]);
+  if (!target || target->key().is_depth) return false;
+  const D3D12_RESOURCE_DESC desc = target->resource()->GetDesc();
+  if (desc.SampleDesc.Count != 1) return false;
+  resource_format = desc.Format;
+  view_format = GetColorDrawDXGIFormat(target->key().GetColorFormat());
+  width = uint32_t(desc.Width);
+  height = desc.Height;
+  return true;
+}
+
+bool D3D12RenderTargetCache::CopyBoundColorTarget0(ID3D12Resource* dest, uint32_t width,
+                                                   uint32_t height) {
+  if (path_ != Path::kHostRenderTargets || !dest || !command_processor_.IsSubmissionOpen()) {
+    return false;
+  }
+  auto* target = static_cast<D3D12RenderTarget*>(last_update_accumulated_render_targets()[1]);
+  if (!target || target->key().is_depth) return false;
+  ID3D12Resource* resource = target->resource();
+  const D3D12_RESOURCE_DESC desc = resource->GetDesc();
+  if (desc.SampleDesc.Count != 1 || width > desc.Width || height > desc.Height) return false;
+  const D3D12_RESOURCE_STATES old_state =
+      target->SetResourceState(D3D12_RESOURCE_STATE_COPY_SOURCE);
+  command_processor_.PushTransitionBarrier(resource, old_state,
+                                           D3D12_RESOURCE_STATE_COPY_SOURCE);
+  command_processor_.SubmitBarriers();
+  D3D12_TEXTURE_COPY_LOCATION source = {};
+  source.pResource = resource;
+  source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+  D3D12_TEXTURE_COPY_LOCATION destination = {};
+  destination.pResource = dest;
+  destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+  D3D12_BOX box = {0, 0, 0, width, height, 1};
+  command_processor_.GetDeferredCommandList().D3DCopyTextureRegion(&destination, 0, 0, 0,
+                                                                   &source, &box);
+  command_processor_.PushTransitionBarrier(resource, target->SetResourceState(old_state),
+                                           old_state);
+  return true;
+}
+
 bool D3D12RenderTargetCache::QueueCameraDepthClearReadback(
     uint64_t frame, uint64_t draw, uint64_t clear_draw, bool after_alias) {
   if (!frame || !draw || !clear_draw || path_ != Path::kHostRenderTargets ||

@@ -75,6 +75,7 @@ REXCVAR_DECLARE(std::string, input_bind_start);
 #include <rex/ui/frame_rate_policy.h>
 #include <rex/ui/frame_latency.h>
 #include <rex/ui/d3d12/streamline_bridge.h>
+#include <rex/ui/d3d12/openxr_screen.h>
 #include <rex/audio/xma/decoder.h>
 #include <rex/crypto/sha256.h>
 #include <rex/graphics/embedded_debug_overlay_policy.h>
@@ -2502,6 +2503,53 @@ extern "C" REX_GPU_PLUGIN_EXPORT void rex_gpu_embedded_input_sample(void* handle
   rex::ui::frame_latency::InputSample();
 }
 
+// VR (experimental, openxr_screen.h): the head pose for the next frame and
+// the hand controllers. Any thread; returns 0 while stereo is off. The layout
+// is shared with the runtime (runtime_vr.h, RuntimeVrState).
+struct RexVrState {
+  uint32_t struct_size;
+  uint32_t head_id;
+  float head_orientation[4];
+  float head_position[3];
+  float eye_offset[2][3];
+  float tan_half_fov_x;
+  float tan_half_fov_y;
+  uint32_t hand_valid[2];
+  float hand_orientation[2][4];
+  float hand_position[2][3];
+  float trigger[2];
+  float grip[2];
+  float stick[2][2];
+  uint32_t buttons[2];
+};
+extern "C" REX_GPU_PLUGIN_EXPORT uint32_t rex_gpu_embedded_vr_state(void* handle,
+                                                                   RexVrState* out) {
+  namespace xr = rex::ui::d3d12::openxr_screen;
+  if (!handle || !out || out->struct_size != sizeof(RexVrState)) return 0;
+  xr::HeadView head;
+  if (!xr::LatestHeadView(head)) return 0;
+  out->head_id = head.id;
+  std::memcpy(out->head_orientation, head.orientation, sizeof(out->head_orientation));
+  std::memcpy(out->head_position, head.position, sizeof(out->head_position));
+  std::memcpy(out->eye_offset, head.eye_offset, sizeof(out->eye_offset));
+  out->tan_half_fov_x = head.tan_half_fov_x;
+  out->tan_half_fov_y = head.tan_half_fov_y;
+  xr::Controllers controllers;
+  xr::LatestControllers(controllers);
+  for (int hand = 0; hand < 2; ++hand) {
+    const xr::Hand& source = controllers.hand[hand];
+    out->hand_valid[hand] = source.valid ? 1u : 0u;
+    std::memcpy(out->hand_orientation[hand], source.orientation, sizeof(source.orientation));
+    std::memcpy(out->hand_position[hand], source.position, sizeof(source.position));
+    out->trigger[hand] = source.trigger;
+    out->grip[hand] = source.grip;
+    out->stick[hand][0] = source.stick[0];
+    out->stick[hand][1] = source.stick[1];
+    out->buttons[hand] = source.buttons;
+  }
+  return 1;
+}
+
 // Called by the embedded runtime's VdSwap once the frame's swap command is
 // written (before the title makes it visible to the command processor), for
 // the frame tracking. Never touches guest state.
@@ -2658,6 +2706,46 @@ rex_gpu_embedded_poll_keyboard_mouse(
   if (embedded->keyboard_mouse->GetState(user_index, &state) != 0) {
     return 0;
   }
+  // VR (experimental): the hand controllers as the title's pad, merged with
+  // the keyboard and mouse (docs/VR_TEST_SESSION.md has the layout).
+  rex::ui::d3d12::openxr_screen::Controllers vr;
+  if (user_index == 0 && rex::ui::d3d12::openxr_screen::LatestControllers(vr) &&
+      (vr.hand[0].valid || vr.hand[1].valid)) {
+    const auto& left = vr.hand[0];
+    const auto& right = vr.hand[1];
+    uint16_t buttons = 0;
+    if (right.buttons & 1u) buttons |= 0x1000;  // A
+    if (right.buttons & 2u) buttons |= 0x2000;  // B
+    if (left.buttons & 1u) buttons |= 0x4000;   // X
+    if (left.buttons & 2u) buttons |= 0x8000;   // Y
+    if (left.buttons & 4u) buttons |= 0x0040;   // left stick click
+    if (right.buttons & 4u) buttons |= 0x0080;  // right stick click
+    if (left.buttons & 8u) buttons |= 0x0010;   // menu = Start
+    const bool power_select = left.grip > 0.5f;
+    if (power_select) {
+      // Darkness powers: hold the left grip and flick the right stick
+      // (D-pad: up, down, left, right).
+      if (right.stick[1] > 0.7f) buttons |= 0x0001;
+      if (right.stick[1] < -0.7f) buttons |= 0x0002;
+      if (right.stick[0] < -0.7f) buttons |= 0x0004;
+      if (right.stick[0] > 0.7f) buttons |= 0x0008;
+    } else {
+      if (right.stick[1] > 0.7f) buttons |= 0x0001;
+      if (right.stick[1] < -0.7f) buttons |= 0x0002;
+      if (right.grip > 0.5f) buttons |= 0x0200;  // RB
+    }
+    if (left.grip > 0.5f && right.grip > 0.5f) buttons |= 0x0100;  // LB (both grips)
+    state.gamepad.buttons = uint16_t(uint16_t(state.gamepad.buttons) | buttons);
+    state.gamepad.left_trigger = std::max<uint8_t>(
+        uint8_t(state.gamepad.left_trigger), uint8_t(std::clamp(left.trigger, 0.0f, 1.0f) * 255.0f));
+    state.gamepad.right_trigger = std::max<uint8_t>(
+        uint8_t(state.gamepad.right_trigger), uint8_t(std::clamp(right.trigger, 0.0f, 1.0f) * 255.0f));
+    if (left.valid && std::hypot(left.stick[0], left.stick[1]) > 0.15f) {
+      state.gamepad.thumb_lx = int16_t(std::clamp(left.stick[0], -1.0f, 1.0f) * 32767.0f);
+      state.gamepad.thumb_ly = int16_t(std::clamp(left.stick[1], -1.0f, 1.0f) * 32767.0f);
+    }
+    state.packet_number = uint32_t(state.packet_number) + 1;
+  }
   output->packet_number = static_cast<uint32_t>(state.packet_number);
   output->buttons = static_cast<uint16_t>(state.gamepad.buttons);
   output->left_trigger = state.gamepad.left_trigger;
@@ -2688,6 +2776,27 @@ rex_gpu_embedded_consume_mouse_look(void* handle, uint32_t user_index,
   int32_t dx = 0;
   int32_t dy = 0;
   output->active = embedded->keyboard_mouse->ConsumeMouseLook(user_index, dx, dy) ? 1u : 0u;
+  // VR hand aim and turning (radians) as counts: 12 title units (1/65536
+  // turn) per count at sensitivity 1 (native look), sub-count remainders kept.
+  if (user_index == 0) {
+    double yaw = 0.0, pitch = 0.0;
+    rex::ui::d3d12::openxr_screen::TakeLook(yaw, pitch);
+    if (yaw != 0.0 || pitch != 0.0) {
+      static double remainder_x = 0.0, remainder_y = 0.0;
+      const double sensitivity =
+          std::max(0.01, double(rex::input::mnk::MnkInputDriver::MouseSensitivity()));
+      const double counts_per_radian = 65536.0 / (2.0 * 3.14159265358979) / 12.0 / sensitivity;
+      remainder_x += yaw * counts_per_radian;
+      remainder_y += -pitch * counts_per_radian *
+                     (rex::input::mnk::MnkInputDriver::MouseInvertY() ? -1.0 : 1.0);
+      const int32_t vx = int32_t(remainder_x), vy = int32_t(remainder_y);
+      remainder_x -= vx;
+      remainder_y -= vy;
+      dx += vx;
+      dy += vy;
+      if (vx || vy) output->active = 1u;
+    }
+  }
   output->dx = dx;
   output->dy = dy;
   output->sensitivity =

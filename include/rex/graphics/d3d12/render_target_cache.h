@@ -115,6 +115,14 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
                                 const char* dump_path,
                                 uint64_t maximum_fp16_bytes);
 
+  // Temporal upscaling (#3): the bound colour render target 0 (single-sample
+  // host render targets only): its resource and view formats and size, and a
+  // copy of its region (0,0)-(width,height) into dest (created by the caller
+  // with the resource format). Safe right after a draw.
+  bool BoundColorTarget0Format(DXGI_FORMAT& resource_format, DXGI_FORMAT& view_format,
+                               uint32_t& width, uint32_t& height) const;
+  bool CopyBoundColorTarget0(ID3D12Resource* dest, uint32_t width, uint32_t height);
+
   // Packs and reads back the currently accumulated D24FS8 scene depth target.
   // This is an opt-in bounded diagnostic for comparing scaled depth/stencil
   // parity before a guest draw; it doesn't alter guest memory or draw state.

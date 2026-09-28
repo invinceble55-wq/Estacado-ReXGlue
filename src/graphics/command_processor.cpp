@@ -1912,7 +1912,9 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
   uint32_t frontbuffer_ptr = reader->ReadAndSwap<uint32_t>();
   uint32_t frontbuffer_width = reader->ReadAndSwap<uint32_t>();
   uint32_t frontbuffer_height = reader->ReadAndSwap<uint32_t>();
-  reader->AdvanceRead((count - 4) * sizeof(uint32_t));
+  // A fifth word: the host's frame tag (VR eye and head view, openxr_screen.h).
+  swap_frame_tag_ = count >= 5 ? reader->ReadAndSwap<uint32_t>() : 0;
+  reader->AdvanceRead((count - (count >= 5 ? 5 : 4)) * sizeof(uint32_t));
 
   const bool cadence_enabled = kGpuDiagnostics &&
       !kernel_state_ && REXCVAR_GET(embedded_cp_cadence_diagnostics);
